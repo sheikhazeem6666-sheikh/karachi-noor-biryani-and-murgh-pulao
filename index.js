@@ -171,7 +171,7 @@ app.post("/webhook", async (req, res) => {
     await sendMessage(from, reply);
     res.sendStatus(200);
   } catch (err) {
-    console.error("Error handling message:", err.message);
+    console.error("Error handling message:", err.response ? JSON.stringify(err.response.data) : err.message);
     res.sendStatus(200); // Meta ko hamesha 200 bhejna zaroori hai, warna woh retry karta rehta hai
   }
 });
