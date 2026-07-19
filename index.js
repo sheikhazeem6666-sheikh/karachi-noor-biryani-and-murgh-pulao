@@ -58,7 +58,7 @@ const sessions = {};
 
 function getSession(phone) {
   if (!sessions[phone]) {
-    sessions[phone] = { stage: "menu", cart: [], address: "", customerName: "" };
+    sessions[phone] = { stage: "menu", cart: [], address: "", customerName: "", aiHistory: [] };
   }
   return sessions[phone];
 }
@@ -253,7 +253,7 @@ async function handleRiderReply(riderId, text) {
   if (text === "2") {
     await ordersRef.doc(orderId).update({ status: "delivered" });
     await ridersRef.doc(riderId).update({ status: "available", activeOrderId: admin.firestore.FieldValue.delete() });
-    await sendMessage(order.customerPhone, "✅ Aapka order deliver ho gaya hai. Khaane ka mazaa lein! 🍛 Shukriya Ummat Foods choose karne ke liye.");
+    await sendMessage(order.customerPhone, "✅ Aapka order deliver ho gaya hai. Khaane ka mazaa lein! 🍛 Shukriya Karachi Noor Biryani & Murgh Pulao choose karne ke liye.");
     return "✅ Status update ho gaya: Delivered. Aap ab agla order lene ke liye available hain.";
   }
 
@@ -450,7 +450,13 @@ app.post("/webhook", async (req, res) => {
         reply = "Hum aapki payment screenshot ka intezaar kar rahe hain. Bhej dein taake order confirm ho jaye.";
       }
     } else {
-     reply = await getHaikuReply(text);
+     reply = await getHaikuReply(text, session.aiHistory);
+     session.aiHistory.push({ role: "user", content: text });
+     session.aiHistory.push({ role: "assistant", content: reply });
+     // Sirf pichli 10 baatein yaad rakho, taake message zyada bada na ho
+     if (session.aiHistory.length > 20) {
+       session.aiHistory = session.aiHistory.slice(-20);
+     }
     }
 
     await sendMessage(from, reply);
