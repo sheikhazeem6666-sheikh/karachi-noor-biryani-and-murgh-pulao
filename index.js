@@ -5,7 +5,7 @@
 const express = require("express");
 const axios = require("axios");
 const admin = require("firebase-admin");
-const { getHaikuReply } = require('./haiku-integration');
+const { getHaikuReply, verifyPaymentScreenshot } = require('./haiku-integration');
 
 const app = express();
 app.use(express.json());
@@ -97,6 +97,78 @@ function formatPhoneForMsg(phone) {
   let s = String(phone).replace(/\D/g, "");
   if (s.startsWith("92")) s = "0" + s.slice(2);
   return s;
+}
+
+// WhatsApp se image download kar ke base64 mein convert karta hai
+async function downloadWhatsAppMedia(mediaId) {
+  const metaRes = await axios.get(`https://graph.facebook.com/v20.0/${mediaId}`, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+  });
+  const { url, mime_type } = metaRes.data;
+
+  const fileRes = await axios.get(url, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    responseType: "arraybuffer",
+  });
+
+  return { base64: Buffer.from(fileRes.data).toString("base64"), mimeType: mime_type };
+}
+
+// Do phone numbers ke aakhri digits compare karta hai (formatting farq nazarandaz kar ke)
+function numbersRoughlyMatch(a, b) {
+  if (!a || !b) return false;
+  const da = String(a).replace(/\D/g, "");
+  const db = String(b).replace(/\D/g, "");
+  if (da.length < 7 || db.length < 7) return false;
+  return da.slice(-9) === db.slice(-9) || da.endsWith(db.slice(-9)) || db.endsWith(da.slice(-9));
+}
+
+// Payment screenshot download + verify karta hai aur order ke amount/number se match karta hai
+// Returns { ok: true } agar sab theek hai, warna { ok: false, reason: "..." }
+async function checkPaymentScreenshot(message, expectedAmount) {
+  try {
+    const { base64, mimeType } = await downloadWhatsAppMedia(message.image.id);
+    const result = await verifyPaymentScreenshot(base64, mimeType);
+
+    if (result.verifyFailed) {
+      // AI verify nahi kar saka (jaise network issue) — order rukwaane ke bajaye aage jaane dete hain
+      return { ok: true };
+    }
+
+    if (!result.isPaymentScreenshot) {
+      return { ok: false, reason: "Yeh payment screenshot nahi lag rahi. Please JazzCash/Easypaisa ki confirmation screenshot bhejein." };
+    }
+
+    if (result.amount !== null && result.amount !== undefined) {
+      const diff = Math.abs(Number(result.amount) - Number(expectedAmount));
+      if (isNaN(diff) || diff > 1) {
+        return { ok: false, reason: `Screenshot mein amount Rs. ${result.amount} hai, lekin aapke order ki total amount Rs. ${expectedAmount} hai. Please sahi screenshot bhejein.` };
+      }
+    }
+
+    if (result.accountNumber) {
+      const matchesJazzcash = numbersRoughlyMatch(result.accountNumber, PAYMENT_INFO.jazzcash);
+      const matchesEasypaisa = numbersRoughlyMatch(result.accountNumber, PAYMENT_INFO.easypaisa);
+      if (!matchesJazzcash && !matchesEasypaisa) {
+        return { ok: false, reason: "Yeh payment humare JazzCash/Easypaisa number pe nahi gayi lagti. Please sahi number pe payment ki screenshot bhejein." };
+      }
+    }
+
+    if (result.dateTime) {
+      const parsed = new Date(result.dateTime);
+      if (!isNaN(parsed.getTime())) {
+        const hoursOld = (Date.now() - parsed.getTime()) / (1000 * 60 * 60);
+        if (hoursOld > 48) {
+          return { ok: false, reason: "Yeh screenshot purani lag rahi hai. Please abhi ki payment ki screenshot bhejein." };
+        }
+      }
+    }
+
+    return { ok: true };
+  } catch (err) {
+    console.error("Payment screenshot check failed:", err.message);
+    return { ok: true }; // technical error ki wajah se order na atke
+  }
 }
 
 // Rider ka number + live location customer ko automatically bhejta hai
@@ -423,9 +495,15 @@ app.post("/webhook", async (req, res) => {
         `Payment karne ke baad screenshot yahan bhej dein — order seedha kitchen ko Table ${session.tableNumber} ke naam bhej diya jayega.`;
     } else if (session.stage === "dinein_payment") {
       if (message.type === "image") {
-        await notifyStaffDineIn(session.tableNumber, session.customerName, session.cart);
-        reply = `✅ Payment mil gayi hai, ${session.customerName}! Aapka order kitchen ko bhej diya gaya hai — *Table ${session.tableNumber}*. Taiyar hote hi table pe pahunch jayega. Shukriya! 🍛`;
-        delete sessions[from];
+        const total = cartTotal(session.cart);
+        const check = await checkPaymentScreenshot(message, total);
+        if (check.ok) {
+          await notifyStaffDineIn(session.tableNumber, session.customerName, session.cart);
+          reply = `✅ Payment mil gayi hai, ${session.customerName}! Aapka order kitchen ko bhej diya gaya hai — *Table ${session.tableNumber}*. Taiyar hote hi table pe pahunch jayega. Shukriya! 🍛`;
+          delete sessions[from];
+        } else {
+          reply = `⚠️ ${check.reason}`;
+        }
       } else {
         reply = "Hum aapki payment screenshot ka intezaar kar rahe hain. Bhej dein taake order kitchen tak jaye.";
       }
@@ -444,8 +522,14 @@ app.post("/webhook", async (req, res) => {
       session.stage = "waiting_payment";
     } else if (session.stage === "waiting_payment") {
       if (message.type === "image") {
-        reply = await assignRiderToOrder(from, session);
-        delete sessions[from];
+        const total = cartTotal(session.cart);
+        const check = await checkPaymentScreenshot(message, total);
+        if (check.ok) {
+          reply = await assignRiderToOrder(from, session);
+          delete sessions[from];
+        } else {
+          reply = `⚠️ ${check.reason}`;
+        }
       } else {
         reply = "Hum aapki payment screenshot ka intezaar kar rahe hain. Bhej dein taake order confirm ho jaye.";
       }
