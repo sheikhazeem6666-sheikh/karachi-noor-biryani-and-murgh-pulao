@@ -1,4 +1,4 @@
-Kar diy// Karachi Noor Biryani & Murgh Pulao - WhatsApp Order Bot
+// Karachi Noor Biryani & Murgh Pulao - WhatsApp Order Bot
 // Yeh code Meta WhatsApp Cloud API + Firebase Firestore use karta hai
 // Features: Menu/Order, Payment, Automatic Rider Assignment, Delivery Tracking, Location Forwarding
 
@@ -99,6 +99,26 @@ function formatPhoneForMsg(phone) {
   return s;
 }
 
+// Rider ka number + live location customer ko automatically bhejta hai
+async function notifyCustomerOfRiderLocation(riderId, riderData) {
+  const orderId = riderData.activeOrderId;
+  if (!orderId) return;
+
+  const orderSnap = await ordersRef.doc(orderId).get();
+  if (!orderSnap.exists) return;
+  const order = orderSnap.data();
+  if (!order.customerPhone) return;
+
+  const riderPhoneDisplay = formatPhoneForMsg(riderId);
+  let msg = `🛵 *${riderData.name || "Aapka rider"}* aapki delivery ke liye nikal chuke hain.\nNumber: ${riderPhoneDisplay}`;
+
+  if (typeof riderData.lat === "number" && typeof riderData.lng === "number") {
+    msg += `\nLive Location: ${mapsLink(riderData.lat, riderData.lng)}`;
+  }
+
+  await sendMessage(order.customerPhone, msg);
+}
+
 // ============================================
 // RIDER HELPERS
 // ============================================
@@ -159,6 +179,9 @@ async function assignRiderToOrder(customerPhone, session) {
       `Jab order pick kar lein to reply karein: *1*\n` +
       `Jab deliver ho jaye to reply karein: *2*`;
     await sendMessage(assignedRider.id, riderMsg);
+
+    // Agar rider ki location pehle se pata hai, to customer ko turant number+location bhej do
+    await notifyCustomerOfRiderLocation(assignedRider.id, { ...assignedRider, activeOrderId: orderRef.id });
 
     return `✅ Payment screenshot mil gayi hai. Aapka order confirm ho gaya hai — *${riderDisplayName}* aapki delivery ke liye assign ho gaye hain. Jald hi pahunch jayega! 🍛`;
   } else {
@@ -312,6 +335,13 @@ app.post("/webhook", async (req, res) => {
           lng: longitude,
           locationUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+
+        // Agar is rider ke pass active order hai, to customer ko turant number+location bhej do
+        const riderData = riderDoc.data();
+        if (riderData.activeOrderId) {
+          await notifyCustomerOfRiderLocation(from, { ...riderData, lat: latitude, lng: longitude });
+        }
+
         await sendMessage(from, "📍 Aapki location update ho gayi hai. Shukriya!");
         return res.sendStatus(200);
       }
