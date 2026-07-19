@@ -126,12 +126,21 @@ function numbersRoughlyMatch(a, b) {
 // Payment screenshot download + verify karta hai aur order ke amount/number se match karta hai
 // Returns { ok: true } agar sab theek hai, warna { ok: false, reason: "..." }
 async function checkPaymentScreenshot(message, expectedAmount) {
+  // ============================================
+  // WAQTI TOR PAR RESTRICTIONS HATAI GAYI HAIN (temporary bypass)
+  // Ab koi bhi image bhejne par payment turant accept ho jayegi.
+  // Amount/account-number/date verification abhi OFF hai.
+  // Dubara ON karne ke liye neeche wala commented block use karein
+  // aur ye "return { ok: true };" line hata dein.
+  // ============================================
+  return { ok: true };
+
+  /* ORIGINAL VERIFICATION LOGIC — dubara chalu karne ke liye is comment ko hatayein:
   try {
     const { base64, mimeType } = await downloadWhatsAppMedia(message.image.id);
     const result = await verifyPaymentScreenshot(base64, mimeType);
 
     if (result.verifyFailed) {
-      // AI verify nahi kar saka (jaise network issue) — order rukwaane ke bajaye aage jaane dete hain
       return { ok: true };
     }
 
@@ -167,8 +176,9 @@ async function checkPaymentScreenshot(message, expectedAmount) {
     return { ok: true };
   } catch (err) {
     console.error("Payment screenshot check failed:", err.message);
-    return { ok: true }; // technical error ki wajah se order na atke
+    return { ok: true };
   }
+  */
 }
 
 // Rider ka number + live location customer ko automatically bhejta hai
@@ -255,9 +265,9 @@ async function assignRiderToOrder(customerPhone, session) {
     // Agar rider ki location pehle se pata hai, to customer ko turant number+location bhej do
     await notifyCustomerOfRiderLocation(assignedRider.id, { ...assignedRider, activeOrderId: orderRef.id });
 
-    return `✅ Payment screenshot mil gayi hai. Aapka order confirm ho gaya hai — *${riderDisplayName}* aapki delivery ke liye assign ho gaye hain. Jald hi pahunch jayega! 🍛`;
+    return `✅ *Payment Accepted!* Aapka order confirm ho gaya hai — *${riderDisplayName}* aapki delivery ke liye assign ho gaye hain. Jald hi pahunch jayega! 🍛`;
   } else {
-    return `✅ Payment screenshot mil gayi hai. Order confirm ho gaya hai — filhal hamare riders busy hain, jaise hi koi free hota hai order assign kar diya jayega. Shukriya! 🙏`;
+    return `✅ *Payment Accepted!* Order confirm ho gaya hai — filhal hamare riders busy hain, jaise hi koi free hota hai order assign kar diya jayega. Shukriya! 🙏`;
   }
 }
 
@@ -499,7 +509,7 @@ app.post("/webhook", async (req, res) => {
         const check = await checkPaymentScreenshot(message, total);
         if (check.ok) {
           await notifyStaffDineIn(session.tableNumber, session.customerName, session.cart);
-          reply = `✅ Payment mil gayi hai, ${session.customerName}! Aapka order kitchen ko bhej diya gaya hai — *Table ${session.tableNumber}*. Taiyar hote hi table pe pahunch jayega. Shukriya! 🍛`;
+          reply = `✅ *Payment Accepted!* ${session.customerName}, aapka order kitchen ko bhej diya gaya hai — *Table ${session.tableNumber}*. Taiyar hote hi table pe pahunch jayega. Shukriya! 🍛`;
           delete sessions[from];
         } else {
           reply = `⚠️ ${check.reason}`;
