@@ -352,7 +352,7 @@ app.post("/webhook", async (req, res) => {
         reply = "Hum aapki payment screenshot ka intezaar kar rahe hain. Bhej dein taake order confirm ho jaye.";
       }
     } else {
-      reply = "Maaf kijiye, samajh nahi aaya. Menu dekhne ke liye *menu* likhein.";
+     reply = await getHaikuReply(text);
     }
 
     await sendMessage(from, reply);
