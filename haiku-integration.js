@@ -52,3 +52,47 @@ async function getHaikuReply(userMessage, conversationHistory = []) {
 }
 
 module.exports = { getHaikuReply };
+
+/**
+ * Payment screenshot ko "parh" kar amount, account number, aur date/time nikalta hai
+ * @param {string} base64Image - Image ka base64 data
+ * @param {string} mimeType - jaise 'image/jpeg' ya 'image/png'
+ * @returns {Promise<Object>} - { isPaymentScreenshot, amount, accountNumber, dateTime }
+ */
+async function verifyPaymentScreenshot(base64Image, mimeType) {
+  const VERIFY_PROMPT = `Aap ek JazzCash/Easypaisa payment screenshot verifier hain. Aapko ek image di jayegi.
+
+Is image ko dhyan se dekh kar yeh maloomat nikalein:
+- isPaymentScreenshot: true agar yeh koi JazzCash, Easypaisa, ya bank transfer confirmation screenshot hai, warna false (jaise agar khaane ki photo, random image, ya kuch aur hai to false)
+- amount: transaction ki amount, sirf number (Rs/PKR ka symbol chhod kar), agar na mile to null
+- accountNumber: jis number/account pe paisa bheja gaya hai (receiver), sirf digits, agar na mile to null
+- dateTime: transaction ki date aur time jo screenshot mein likhi ho, jaise likhi hai waisi hi string mein, agar na mile to null
+
+Sirf neeche diye JSON format mein jawab dein, koi aur text, explanation, ya markdown fences bilkul na likhein:
+{"isPaymentScreenshot": true, "amount": 500, "accountNumber": "03005583968", "dateTime": "19 Jul 2026, 5:32 PM"}`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 300,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Image } },
+            { type: 'text', text: VERIFY_PROMPT },
+          ],
+        },
+      ],
+    });
+
+    let text = response.content[0].text.trim();
+    text = text.replace(/```json|```/g, '').trim();
+    return JSON.parse(text);
+  } catch (error) {
+    console.error('Payment verification error:', error.message);
+    return { isPaymentScreenshot: null, amount: null, accountNumber: null, dateTime: null, verifyFailed: true };
+  }
+}
+
+module.exports = { getHaikuReply, verifyPaymentScreenshot };
