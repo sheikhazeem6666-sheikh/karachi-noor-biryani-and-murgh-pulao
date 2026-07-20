@@ -938,7 +938,13 @@ app.post("/webhook", async (req, res) => {
       session.tableNumber = tableMatch[1];
       session.stage = "ordering";
       reply = `🍽️ *Table ${session.tableNumber}* — Khush aamdeed!\n\n${menuText()}`;
-    } else if (session.stage === "menu" || ["menu", "hi", "hello", "salam"].includes(lower)) {
+    } else if (
+      session.stage === "menu" ||
+      ["menu", "hi", "hello", "salam"].includes(lower) ||
+      /\b(rate|rates|price|prices|qeemat|qeematen|rate list|price list)\b/.test(lower)
+    ) {
+      // NAYA: "rate list", "price", "qeemat" jaisi queries ab hamesha seedha real
+      // menu dikhati hain — AI ke paas nahi jatin, taake rates kabhi galat na hon.
       reply = menuText();
       session.stage = "ordering";
     } else if (session.stage === "ordering" && /^\d+x\d+$/.test(lower)) {
