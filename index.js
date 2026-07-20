@@ -33,6 +33,7 @@ const db = admin.firestore();
 const ridersRef = db.collection("riders");
 const ordersRef = db.collection("orders");
 const complaintsRef = db.collection("complaints");
+const riderIssuesRef = db.collection("riderIssues");
 const countersRef = db.collection("meta").doc("counters");
 
 // Order ka agla serial number nikalta hai (1, 2, 3...) — transaction safe hai
@@ -340,41 +341,49 @@ async function handleRiderReply(riderId, text) {
 
   const rider = riderDoc.data();
   const orderId = rider.activeOrderId;
-  if (!orderId) {
-    return "Filhal aapke pass koi active order nahi hai.";
-  }
 
-  const orderSnap = await ordersRef.doc(orderId).get();
-  if (!orderSnap.exists) return "Order record nahi mila.";
-  const order = orderSnap.data();
-
-  if (text === "1") {
-    await ordersRef.doc(orderId).update({ status: "out_for_delivery" });
-
-    const riderPhoneDisplay = formatPhoneForMsg(riderId);
-    let customerMsg =
-      `🛵 Aapka order${order.orderNumber ? ` (Order #${order.orderNumber})` : ""} out for delivery hai!\n\n` +
-      `Rider: *${rider.name || "N/A"}*\n` +
-      `Number: ${riderPhoneDisplay}`;
-
-    if (typeof rider.lat === "number" && typeof rider.lng === "number") {
-      customerMsg += `\nLive Location: ${mapsLink(rider.lat, rider.lng)}`;
+  // "1" aur "2" khaas commands hain (pickup/delivered) — inke liye active order zaroori hai
+  if (text === "1" || text === "2") {
+    if (!orderId) {
+      return "Filhal aapke pass koi active order nahi hai.";
     }
 
-    customerMsg += `\n\nJald hi aap tak pahunch jayega!`;
+    const orderSnap = await ordersRef.doc(orderId).get();
+    if (!orderSnap.exists) return "Order record nahi mila.";
+    const order = orderSnap.data();
 
-    await sendMessage(order.customerPhone, customerMsg);
-    return "✅ Status update ho gaya: Out for Delivery. Customer ko aapka number aur location bhej di gayi hai.";
-  }
+    if (text === "1") {
+      await ordersRef.doc(orderId).update({ status: "out_for_delivery" });
 
-  if (text === "2") {
+      const riderPhoneDisplay = formatPhoneForMsg(riderId);
+      let customerMsg =
+        `🛵 Aapka order${order.orderNumber ? ` (Order #${order.orderNumber})` : ""} out for delivery hai!\n\n` +
+        `Rider: *${rider.name || "N/A"}*\n` +
+        `Number: ${riderPhoneDisplay}`;
+
+      if (typeof rider.lat === "number" && typeof rider.lng === "number") {
+        customerMsg += `\nLive Location: ${mapsLink(rider.lat, rider.lng)}`;
+      }
+
+      customerMsg += `\n\nJald hi aap tak pahunch jayega!`;
+
+      await sendMessage(order.customerPhone, customerMsg);
+      return "✅ Status update ho gaya: Out for Delivery. Customer ko aapka number aur location bhej di gayi hai.";
+    }
+
+    // text === "2"
     await ordersRef.doc(orderId).update({ status: "delivered" });
     await ridersRef.doc(riderId).update({ status: "available", activeOrderId: admin.firestore.FieldValue.delete() });
     await sendMessage(order.customerPhone, "✅ Aapka order deliver ho gaya hai. Khaane ka mazaa lein! 🍛 Shukriya Karachi Noor Biryani & Murgh Pulao choose karne ke liye.");
     return "✅ Status update ho gaya: Delivered. Aap ab agla order lene ke liye available hain.";
   }
 
-  return "Reply *1* (picked up) ya *2* (delivered) likhein.";
+  // Koi bhi aur message (chahe kuch bhi likha ho) — dashboard pe report ban jayega,
+  // rider ki ID, naam, number, location, aur uska masla sab ke sath
+  const urgent = await fileRiderIssue(riderId, rider, text, orderId || null);
+  return urgent
+    ? "🚨 Aapki emergency report mil gayi hai, staff ko foran alert kar diya gaya hai. Madad jald pahunchegi. Khud ko mehfooz rakhein!"
+    : "⚠️ Aapki report dashboard par bhej di gayi hai, staff ko inform kar diya gaya hai. Shukriya batane ke liye.";
 }
 
 // Dine-in (table QR) order ko kitchen/staff ko notify karo (payment confirm hone ke baad)
@@ -453,6 +462,71 @@ async function fileComplaint(customerPhone, complaintText) {
 
   await complaintsRef.add(complaintData);
   return recentOrder;
+}
+
+// ============================================
+// RIDER ISSUES (safety — petrol khatam, tyre puncture, accident, etc.)
+// ============================================
+
+// Accident jaisi emergency wale alfaz — inke aane par staff ko FAURAN alert jayega
+const URGENT_RIDER_ISSUE_KEYWORDS = ["accident", "hadsa", "hadsha", "chot", "zakhmi", "girne", "gir gaya", "takra"];
+
+// Baaki normal rider issues (safety-critical nahi, lekin dashboard pe track hone chahiye)
+const RIDER_ISSUE_KEYWORDS = [
+  "petrol", "tyre", "tire", "puncher", "puncture", "panchar",
+  "kharab", "breakdown", "band ho gayi", "phas gaya", "phas gayi",
+  ...URGENT_RIDER_ISSUE_KEYWORDS,
+];
+
+function isRiderIssueMessage(lowerText) {
+  return RIDER_ISSUE_KEYWORDS.some((k) => lowerText.includes(k));
+}
+
+function isUrgentRiderIssue(lowerText) {
+  return URGENT_RIDER_ISSUE_KEYWORDS.some((k) => lowerText.includes(k));
+}
+
+// Rider ka issue Firestore mein save karta hai aur agar urgent (accident) ho to staff ko turant alert karta hai
+async function fileRiderIssue(riderId, riderData, issueText, orderId) {
+  const now = new Date();
+  const urgent = isUrgentRiderIssue(issueText.toLowerCase());
+
+  const issueData = {
+    riderPhone: riderId,
+    riderName: riderData.name || null,
+    issueText,
+    urgent,
+    status: "open",
+    relatedOrderId: orderId || null,
+    lat: typeof riderData.lat === "number" ? riderData.lat : null,
+    lng: typeof riderData.lng === "number" ? riderData.lng : null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    createdAtReadable: formatOrderTime(now),
+  };
+
+  await riderIssuesRef.add(issueData);
+
+  if (urgent && STAFF_NUMBER) {
+    const riderPhoneDisplay = formatPhoneForMsg(riderId);
+    let alertMsg =
+      `🚨 *EMERGENCY — Rider Accident/Injury Report*\n\n` +
+      `Rider: *${riderData.name || "N/A"}*\n` +
+      `Number: ${riderPhoneDisplay}\n` +
+      `Message: "${issueText}"`;
+    if (typeof riderData.lat === "number" && typeof riderData.lng === "number") {
+      alertMsg += `\nLast Known Location: ${mapsLink(riderData.lat, riderData.lng)}`;
+    }
+    alertMsg += `\n\n⚠️ Foran contact karein!`;
+    await sendMessage(STAFF_NUMBER, alertMsg);
+  } else if (STAFF_NUMBER) {
+    const riderPhoneDisplay = formatPhoneForMsg(riderId);
+    await sendMessage(
+      STAFF_NUMBER,
+      `⚠️ *Rider Issue Report*\n\nRider: *${riderData.name || "N/A"}*\nNumber: ${riderPhoneDisplay}\nMessage: "${issueText}"`
+    );
+  }
+
+  return urgent;
 }
 
 // ============================================
