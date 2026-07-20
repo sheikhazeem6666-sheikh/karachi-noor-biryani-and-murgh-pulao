@@ -32,6 +32,30 @@ admin.initializeApp({
 const db = admin.firestore();
 const ridersRef = db.collection("riders");
 const ordersRef = db.collection("orders");
+const countersRef = db.collection("meta").doc("counters");
+
+// Order ka agla serial number nikalta hai (1, 2, 3...) — transaction safe hai
+// taake ek sath 2 orders aayen to bhi number duplicate na ho
+async function getNextOrderNumber() {
+  return await db.runTransaction(async (t) => {
+    const snap = await t.get(countersRef);
+    const current = snap.exists && typeof snap.data().orderNumber === "number" ? snap.data().orderNumber : 0;
+    const next = current + 1;
+    t.set(countersRef, { orderNumber: next }, { merge: true });
+    return next;
+  });
+}
+
+// Order ka time Pakistan ke format mein readable banata hai (jaise "8:49 PM, 19 Jul")
+function formatOrderTime(date) {
+  return date.toLocaleString("en-PK", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+    day: "2-digit",
+    month: "short",
+  });
+}
 
 // ============================================
 // MENU
@@ -216,9 +240,13 @@ async function findAvailableRider() {
 // Order confirm hone par automatic rider assign karo (transaction-safe — race condition se bacha hua)
 async function assignRiderToOrder(customerPhone, session) {
   const total = cartTotal(session.cart);
+  const orderNumber = await getNextOrderNumber();
+  const orderTimeDate = new Date();
+  const orderTimeText = formatOrderTime(orderTimeDate);
 
   // Pehle order record bana lo (rider abhi tak pata nahi)
   const orderRef = await ordersRef.add({
+    orderNumber,
     customerPhone,
     cart: session.cart,
     total,
@@ -255,19 +283,24 @@ async function assignRiderToOrder(customerPhone, session) {
 
     const riderMsg =
       `🛵 *Naya Order Assign Hua*\n\n` +
+      `*Order #${orderNumber}*\n` +
+      `Order Time: ${orderTimeText}\n\n` +
       `${cartText(session.cart)}\n\n` +
       `Address: ${session.address}\n` +
       `Customer Number: ${customerPhone}\n\n` +
+      `⚠️ Agar aapke paas pehle se koi purana order hai, to usse pehle deliver karein.\n\n` +
       `Jab order pick kar lein to reply karein: *1*\n` +
       `Jab deliver ho jaye to reply karein: *2*`;
     await sendMessage(assignedRider.id, riderMsg);
 
-    // Agar rider ki location pehle se pata hai, to customer ko turant number+location bhej do
-    await notifyCustomerOfRiderLocation(assignedRider.id, { ...assignedRider, activeOrderId: orderRef.id });
+    // NOTE: Yahan pehle rider ki location turant customer ko bhej di jati thi —
+    // lekin wo purani/stale location hoti thi kyunki rider ne abhi tak order
+    // pick nahi kiya hota. Ab location sirf tab bhejenge jab rider "1" (picked up)
+    // reply kare — dekhein handleRiderReply() function mein.
 
-    return `✅ *Payment Accepted!* Aapka order confirm ho gaya hai — *${riderDisplayName}* aapki delivery ke liye assign ho gaye hain. Jald hi pahunch jayega! 🍛`;
+    return `✅ *Payment Accepted!* Aapka order (Order #${orderNumber}) confirm ho gaya hai — *${riderDisplayName}* aapki delivery ke liye assign ho gaye hain. Jald hi pahunch jayega! 🍛`;
   } else {
-    return `✅ *Payment Accepted!* Order confirm ho gaya hai — filhal hamare riders busy hain, jaise hi koi free hota hai order assign kar diya jayega. Shukriya! 🙏`;
+    return `✅ *Payment Accepted!* Order (Order #${orderNumber}) confirm ho gaya hai — filhal hamare riders busy hain, jaise hi koi free hota hai order assign kar diya jayega. Shukriya! 🙏`;
   }
 }
 
@@ -318,7 +351,7 @@ async function handleRiderReply(riderId, text) {
 
     const riderPhoneDisplay = formatPhoneForMsg(riderId);
     let customerMsg =
-      `🛵 Aapka order out for delivery hai!\n\n` +
+      `🛵 Aapka order${order.orderNumber ? ` (Order #${order.orderNumber})` : ""} out for delivery hai!\n\n` +
       `Rider: *${rider.name || "N/A"}*\n` +
       `Number: ${riderPhoneDisplay}`;
 
