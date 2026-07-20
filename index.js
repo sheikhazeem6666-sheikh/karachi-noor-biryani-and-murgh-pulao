@@ -491,6 +491,26 @@ async function fileRiderIssue(riderId, riderData, issueText, orderId) {
   const now = new Date();
   const urgent = isUrgentRiderIssue(issueText.toLowerCase());
 
+  // Order se customer/order ki detail nikal lo (pehchanne mein galti na ho)
+  let orderNumber = null;
+  let customerPhone = null;
+  let customerName = null;
+  let customerAddress = null;
+  if (orderId) {
+    try {
+      const orderSnap = await ordersRef.doc(orderId).get();
+      if (orderSnap.exists) {
+        const orderData = orderSnap.data();
+        orderNumber = orderData.orderNumber || null;
+        customerPhone = orderData.customerPhone || null;
+        customerName = orderData.customerName || null;
+        customerAddress = orderData.address || null;
+      }
+    } catch (err) {
+      console.error("Order detail fetch failed for rider issue:", err.message);
+    }
+  }
+
   const issueData = {
     riderPhone: riderId,
     riderName: riderData.name || null,
@@ -498,6 +518,10 @@ async function fileRiderIssue(riderId, riderData, issueText, orderId) {
     urgent,
     status: "open",
     relatedOrderId: orderId || null,
+    relatedOrderNumber: orderNumber,
+    customerPhone,
+    customerName,
+    customerAddress,
     lat: typeof riderData.lat === "number" ? riderData.lat : null,
     lng: typeof riderData.lng === "number" ? riderData.lng : null,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -506,13 +530,18 @@ async function fileRiderIssue(riderId, riderData, issueText, orderId) {
 
   await riderIssuesRef.add(issueData);
 
+  const orderInfoLines = orderNumber || customerPhone || customerAddress
+    ? `\n${orderNumber ? `Order #${orderNumber}\n` : ""}${customerName ? `Customer: ${customerName}\n` : ""}${customerPhone ? `Customer Number: ${formatPhoneForMsg(customerPhone)}\n` : ""}${customerAddress ? `Address: ${customerAddress}\n` : ""}`
+    : "";
+
   if (urgent && STAFF_NUMBER) {
     const riderPhoneDisplay = formatPhoneForMsg(riderId);
     let alertMsg =
       `🚨 *EMERGENCY — Rider Accident/Injury Report*\n\n` +
       `Rider: *${riderData.name || "N/A"}*\n` +
       `Number: ${riderPhoneDisplay}\n` +
-      `Message: "${issueText}"`;
+      `Message: "${issueText}"\n` +
+      orderInfoLines;
     if (typeof riderData.lat === "number" && typeof riderData.lng === "number") {
       alertMsg += `\nLast Known Location: ${mapsLink(riderData.lat, riderData.lng)}`;
     }
@@ -522,7 +551,8 @@ async function fileRiderIssue(riderId, riderData, issueText, orderId) {
     const riderPhoneDisplay = formatPhoneForMsg(riderId);
     await sendMessage(
       STAFF_NUMBER,
-      `⚠️ *Rider Issue Report*\n\nRider: *${riderData.name || "N/A"}*\nNumber: ${riderPhoneDisplay}\nMessage: "${issueText}"`
+      `⚠️ *Rider Issue Report*\n\nRider: *${riderData.name || "N/A"}*\nNumber: ${riderPhoneDisplay}\nMessage: "${issueText}"\n` +
+        orderInfoLines
     );
   }
 
