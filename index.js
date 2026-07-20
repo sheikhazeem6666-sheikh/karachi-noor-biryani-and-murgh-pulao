@@ -32,6 +32,7 @@ admin.initializeApp({
 const db = admin.firestore();
 const ridersRef = db.collection("riders");
 const ordersRef = db.collection("orders");
+const complaintsRef = db.collection("complaints");
 const countersRef = db.collection("meta").doc("counters");
 
 // Order ka agla serial number nikalta hai (1, 2, 3...) — transaction safe hai
@@ -49,6 +50,7 @@ async function getNextOrderNumber() {
 // Order ka time Pakistan ke format mein readable banata hai (jaise "8:49 PM, 19 Jul")
 function formatOrderTime(date) {
   return date.toLocaleString("en-PK", {
+    timeZone: "Asia/Karachi",
     hour: "2-digit",
     minute: "2-digit",
     hour12: true,
@@ -406,6 +408,54 @@ async function forwardLocationToRider(customerPhone, lat, lng) {
 }
 
 // ============================================
+// COMPLAINTS
+// ============================================
+
+// Complaint wale alfaz check karta hai (Roman Urdu + English)
+const COMPLAINT_KEYWORDS = [
+  "complaint", "complain", "shikayat", "shikayet", "masla", "problem",
+  "kharab", "ghalat", "late", "dair", "mushkil", "issue", "bura",
+];
+
+function isComplaintMessage(lowerText) {
+  return COMPLAINT_KEYWORDS.some((k) => lowerText.includes(k));
+}
+
+// Customer ka sab se recent order Firestore history se nikalta hai
+async function getMostRecentOrderForCustomer(customerPhone) {
+  const snap = await ordersRef
+    .where("customerPhone", "==", customerPhone)
+    .orderBy("createdAt", "desc")
+    .limit(1)
+    .get();
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  return { id: doc.id, ...doc.data() };
+}
+
+// Complaint ko Firestore mein save karta hai — order history se sab detail khud utha leta hai
+async function fileComplaint(customerPhone, complaintText) {
+  const recentOrder = await getMostRecentOrderForCustomer(customerPhone);
+  const now = new Date();
+
+  const complaintData = {
+    customerPhone,
+    complaintText,
+    status: "open",
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    createdAtReadable: formatOrderTime(now),
+    relatedOrderId: recentOrder ? recentOrder.id : null,
+    relatedOrderNumber: recentOrder ? recentOrder.orderNumber || null : null,
+    relatedOrderAddress: recentOrder ? recentOrder.address || null : null,
+    relatedOrderTotal: recentOrder ? recentOrder.total || null : null,
+    relatedOrderStatus: recentOrder ? recentOrder.status || null : null,
+  };
+
+  await complaintsRef.add(complaintData);
+  return recentOrder;
+}
+
+// ============================================
 // WEBHOOK VERIFICATION
 // ============================================
 app.get("/webhook", (req, res) => {
@@ -485,6 +535,21 @@ app.post("/webhook", async (req, res) => {
     const trackingKeywords = ["track", "kahan", "kaha", "kidhar", "location"];
     if (trackingKeywords.some((k) => lower.includes(k))) {
       reply = await getRiderLocationReply(from);
+      await sendMessage(from, reply);
+      return res.sendStatus(200);
+    }
+
+    // Customer complaint/shikayat kar raha hai — sirf tab jab woh apne order ke flow mein na ho
+    // (taake address/menu jaisi normal cheezon ko galti se complaint na samjha jaye)
+    if (
+      message.type === "text" &&
+      isComplaintMessage(lower) &&
+      (session.stage === "menu" || session.stage === "ordering")
+    ) {
+      const recentOrder = await fileComplaint(from, text);
+      reply = recentOrder
+        ? `📝 Aapki shikayat darj ho gayi hai (Order #${recentOrder.orderNumber || "N/A"} se related). Hamari team jald aap se rabta karegi. Shukriya!`
+        : `📝 Aapki shikayat darj ho gayi hai. Hamari team jald aap se rabta karegi. Shukriya!`;
       await sendMessage(from, reply);
       return res.sendStatus(200);
     }
