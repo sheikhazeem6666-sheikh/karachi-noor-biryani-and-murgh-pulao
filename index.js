@@ -428,6 +428,16 @@ async function handleRiderReply(riderId, text) {
   const rider = riderDoc.data();
   const orderId = rider.activeOrderId;
 
+  // NAYA: rider khud apna status wapas "available" kar sakta hai (jaise masla resolve hone ke baad,
+  // ya accident report hone ke baad "issue" status se nikalne ke liye) — "free" ya "available" likh kar
+  if (text.toLowerCase() === "free" || text.toLowerCase() === "available") {
+    await ridersRef.doc(riderId).update({
+      status: "available",
+      activeOrderId: admin.firestore.FieldValue.delete(),
+    });
+    return "✅ Aap ab *available* hain aur naya order lene ke liye ready hain. Shukriya!";
+  }
+
   // "1" aur "2" khaas commands hain (pickup/delivered) — inke liye active order zaroori hai
   if (text === "1" || text === "2") {
     if (!orderId) {
