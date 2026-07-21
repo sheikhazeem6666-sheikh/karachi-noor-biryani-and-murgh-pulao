@@ -198,6 +198,13 @@ function formatPhoneForMsg(phone) {
   return s;
 }
 
+function normalizePhoneForLookup(input) {
+  let s = String(input).replace(/\D/g, "");
+  if (s.startsWith("0")) s = "92" + s.slice(1);
+  if (!s.startsWith("92")) s = "92" + s;
+  return s;
+}
+
 // ============================================
 // LOYALTY POINTS
 // ============================================
@@ -225,8 +232,64 @@ async function addLoyaltyPoints(phone, amount) {
 }
 
 // ============================================
+// CUSTOMER PROFILE (persistent memory across orders)
+// ============================================
+async function saveCustomerProfile(phone, fields) {
+  try {
+    await firestoreOperation(() =>
+      db.collection("customers").doc(phone).set({
+        phone,
+        ...fields,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true })
+    );
+  } catch {}
+}
+
+async function getCustomerProfile(phone) {
+  try {
+    const doc = await firestoreOperation(() => db.collection("customers").doc(phone).get());
+    return doc.exists ? doc.data() : null;
+  } catch {
+    return null;
+  }
+}
+
+// ============================================
 // RIDER FUNCTIONS
 // ============================================
+// A rider's true "current workload" is whatever the orders collection says is still
+// assigned to them — not just the single activeOrderId field, which can go stale
+// (manual reassignment, edge cases, etc). This is the source of truth used for
+// issue handoffs and rider stats.
+async function getRiderActiveOrders(riderId) {
+  try {
+    const snap = await firestoreOperation(() =>
+      db.collection("orders")
+        .where("riderPhone", "==", riderId)
+        .where("status", "in", ["assigned", "out_for_delivery"])
+        .get()
+    );
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch {
+    return [];
+  }
+}
+
+async function getRiderDeliveredCount(riderId) {
+  try {
+    const snap = await firestoreOperation(() =>
+      db.collection("orders")
+        .where("riderPhone", "==", riderId)
+        .where("status", "==", "delivered")
+        .get()
+    );
+    return snap.size;
+  } catch {
+    return null;
+  }
+}
+
 async function findAvailableRider() {
   try {
     const snap = await firestoreOperation(() =>
@@ -261,6 +324,12 @@ async function assignRiderToOrder(customerPhone, session) {
   };
 
   const orderRef = await firestoreOperation(() => db.collection("orders").add(orderData));
+
+  // Keep a durable customer profile (name + last address) so we remember returning customers
+  await saveCustomerProfile(customerPhone, {
+    name: session.customerName || null,
+    lastAddress: session.address || null,
+  });
 
   // Notify dashboard
   notifyDashboard({ ...orderData, id: orderRef.id, event: 'order_created' });
@@ -306,7 +375,7 @@ async function assignRiderToOrder(customerPhone, session) {
       `Address: ${session.address}\n` +
       `Customer Number: ${customerPhone}\n\n` +
       `Jab order pick kar lein to reply karein: *1*\n` +
-      `Jab deliver ho jaye to reply karein: *2*`;
+      `Jab deliver ho jaye to reply karein: *2* ya delivery ki tasveer bhej dein.`;
     await sendMessage(assignedRider.id, riderMsg);
 
     // Add loyalty points
@@ -365,6 +434,17 @@ async function checkAndAssignPendingOrder(orderId) {
   } catch {}
 }
 
+// A rider's lat/lng is only trustworthy for a short window after it was last updated.
+// Otherwise we'd be showing a stale location from a previous delivery as if it were live.
+const RIDER_LOCATION_FRESHNESS_MS = 15 * 60 * 1000;
+
+function isRiderLocationFresh(riderData) {
+  if (typeof riderData.lat !== "number" || typeof riderData.lng !== "number") return false;
+  const updatedAt = riderData.locationUpdatedAt;
+  if (!updatedAt || typeof updatedAt.toDate !== "function") return false;
+  return (Date.now() - updatedAt.toDate().getTime()) <= RIDER_LOCATION_FRESHNESS_MS;
+}
+
 async function notifyCustomerOfRiderLocation(riderId, riderData) {
   const orderId = riderData.activeOrderId;
   if (!orderId) return;
@@ -392,6 +472,15 @@ async function reassignOrderToNewRider(orderId, oldRiderId) {
     );
     if (!orderSnap.exists) return null;
     const order = orderSnap.data();
+
+    // Grab the old rider's last known location BEFORE we touch their doc, so we can
+    // tell the new rider roughly where the order/food currently is (e.g. after an
+    // accident or breakdown) instead of just handing them a bare address.
+    let oldRiderData = null;
+    try {
+      const oldRiderSnap = await firestoreOperation(() => db.collection("riders").doc(oldRiderId).get());
+      if (oldRiderSnap.exists) oldRiderData = oldRiderSnap.data();
+    } catch {}
 
     try {
       await firestoreOperation(() =>
@@ -421,14 +510,24 @@ async function reassignOrderToNewRider(orderId, oldRiderId) {
       });
     });
 
-    const riderMsg =
+    let riderMsg =
       `🛵 *Order Reassign Hua*\n\n` +
       `*Order #${order.orderNumber}*\n\n` +
       `${cartText(order.cart)}\n\n` +
       `Address: ${order.address}\n` +
-      `Customer: ${order.customerPhone}\n\n` +
+      `Customer: ${order.customerPhone}\n\n`;
+
+    if (oldRiderData && typeof oldRiderData.lat === "number" && typeof oldRiderData.lng === "number") {
+      riderMsg +=
+        `⚠️ Pichle rider (*${oldRiderData.name || "N/A"}*) ko raaste mein masla hua tha (late/accident). Unki last known location:\n` +
+        `${mapsLink(oldRiderData.lat, oldRiderData.lng)}\n` +
+        `Order/khana wahan se collect karna pad sakta hai — pehle wahan check karein.\n\n`;
+    }
+
+    riderMsg +=
       `Jab order pick kar lein to reply karein: *1*\n` +
-      `Jab deliver ho jaye to reply karein: *2*`;
+      `Jab deliver ho jaye to reply karein: *2* ya delivery ki tasveer bhej dein.\n` +
+      `(Ya seedha *order ${order.orderNumber} 1* / *order ${order.orderNumber} 2* likh dein.)`;
     await sendMessage(newRider.id, riderMsg);
 
     return newRider;
@@ -453,10 +552,15 @@ async function getRiderLocationReply(customerPhone) {
     const riderDoc = await firestoreOperation(() =>
       db.collection("riders").doc(order.riderPhone).get()
     );
-    if (!riderDoc.exists || typeof riderDoc.data().lat !== "number") {
-      return `🛵 *${riderDoc.exists ? (riderDoc.data().name || "Aapka rider") : "Aapka rider"}* aapki delivery ke liye nikal chuke hain, filhal live location available nahi hai.`;
+    if (!riderDoc.exists) {
+      return "🛵 Aapka rider assign ho chuka hai, filhal live location available nahi hai.";
     }
     const rider = riderDoc.data();
+    // Only trust the location if the rider actually sent an update recently.
+    // Otherwise we'd be showing an old/stale pin as if it were current.
+    if (!isRiderLocationFresh(rider)) {
+      return `🛵 *${rider.name || "Aapka rider"}* aapki delivery ke liye nikal chuke hain, filhal unki taazah live location available nahi hai. Jaise hi rider apni location update karega, hum bhej denge.`;
+    }
     return `🛵 *${rider.name || "Aapka rider"}* is waqt yahan hain:\n${mapsLink(rider.lat, rider.lng)}\n\nJald hi aap tak pahunch jayenge!`;
   } catch {
     return "Location fetch karne mein masla aaya. Thodi dair baad try karein.";
@@ -483,6 +587,61 @@ async function forwardLocationToRider(customerPhone, lat, lng) {
 }
 
 // ============================================
+// DELIVERY CONFIRMATION (shared by "2" text reply and photo proof)
+// ============================================
+async function markOrderOutForDelivery(riderId, rider, orderId) {
+  const orderSnap = await firestoreOperation(() => db.collection("orders").doc(orderId).get());
+  if (!orderSnap.exists) return "Order record nahi mila.";
+  const order = orderSnap.data();
+
+  await firestoreOperation(() =>
+    db.collection("orders").doc(orderId).update({
+      status: "out_for_delivery",
+      pickedUpAt: admin.firestore.FieldValue.serverTimestamp()
+    })
+  );
+  const riderPhoneDisplay = formatPhoneForMsg(riderId);
+  let customerMsg =
+    `🛵 Aapka order${order.orderNumber ? ` (Order #${order.orderNumber})` : ""} out for delivery hai!\n\n` +
+    `Rider: *${rider.name || "N/A"}*\n` +
+    `Number: ${riderPhoneDisplay}`;
+  if (isRiderLocationFresh(rider)) {
+    customerMsg += `\nLive Location: ${mapsLink(rider.lat, rider.lng)}`;
+  }
+  customerMsg += `\n\nJald hi aap tak pahunga jayega!`;
+  await sendMessage(order.customerPhone, customerMsg);
+  return "✅ Status update ho gaya: Out for Delivery.";
+}
+
+async function markOrderDeliveredPendingConfirmation(riderId, orderId) {
+  const orderSnap = await firestoreOperation(() => db.collection("orders").doc(orderId).get());
+  if (!orderSnap.exists) return "Order record nahi mila.";
+  const order = orderSnap.data();
+
+  await firestoreOperation(() =>
+    db.collection("orders").doc(orderId).update({
+      status: "delivered_pending_confirmation",
+      deliveredAt: admin.firestore.FieldValue.serverTimestamp()
+    })
+  );
+  await firestoreOperation(() =>
+    db.collection("riders").doc(riderId).update({
+      status: "available",
+      activeOrderId: admin.firestore.FieldValue.delete()
+    })
+  );
+  // Identify the customer from the order record and ask THEM to confirm — never
+  // assume delivery succeeded just because the rider says so.
+  await sendMessage(
+    order.customerPhone,
+    `✅ Aapka order${order.orderNumber ? ` (Order #${order.orderNumber})` : ""} deliver kar diya gaya hai (rider ne confirmation/tasveer bheji hai).\n\n` +
+      `Agar order sahi salamat mil gaya hai to reply karein: *yes*\n` +
+      `Agar order nahi mila ya koi masla hai to reply karein: *no*`
+  );
+  return "✅ Delivery mark ho gayi — customer se confirmation ka intezar hai (yes/no).";
+}
+
+// ============================================
 // RIDER REPLY HANDLER
 // ============================================
 async function handleRiderReply(riderId, text) {
@@ -506,69 +665,69 @@ async function handleRiderReply(riderId, text) {
 
     if (text === "1" || text === "2") {
       if (!orderId) return "Filhal aapke pass koi active order nahi hai.";
+      if (text === "1") return await markOrderOutForDelivery(riderId, rider, orderId);
+      return await markOrderDeliveredPendingConfirmation(riderId, orderId);
+    }
+
+    // Rider can also give the exact order number, e.g. "10 2" or "order 10 2" — useful
+    // when they're handling a reassigned order or aren't sure activeOrderId matches.
+    const orderNumMatch = text.trim().match(/^(?:order\s*)?#?(\d+)\s+([12])$/i);
+    if (orderNumMatch) {
+      const orderNumber = parseInt(orderNumMatch[1], 10);
+      const action = orderNumMatch[2];
       const orderSnap = await firestoreOperation(() =>
-        db.collection("orders").doc(orderId).get()
+        db.collection("orders")
+          .where("orderNumber", "==", orderNumber)
+          .where("riderPhone", "==", riderId)
+          .limit(1)
+          .get()
       );
-      if (!orderSnap.exists) return "Order record nahi mila.";
-      const order = orderSnap.data();
+      if (orderSnap.empty) return `Order #${orderNumber} aapko assign nahi mila.`;
+      const orderDoc = orderSnap.docs[0];
+      if (action === "1") return await markOrderOutForDelivery(riderId, rider, orderDoc.id);
+      return await markOrderDeliveredPendingConfirmation(riderId, orderDoc.id);
+    }
 
-      if (text === "1") {
-        await firestoreOperation(() =>
-          db.collection("orders").doc(orderId).update({
-            status: "out_for_delivery",
-            pickedUpAt: admin.firestore.FieldValue.serverTimestamp()
-          })
-        );
-        const riderPhoneDisplay = formatPhoneForMsg(riderId);
-        let customerMsg =
-          `🛵 Aapka order${order.orderNumber ? ` (Order #${order.orderNumber})` : ""} out for delivery hai!\n\n` +
-          `Rider: *${rider.name || "N/A"}*\n` +
-          `Number: ${riderPhoneDisplay}`;
-        if (typeof rider.lat === "number" && typeof rider.lng === "number") {
-          customerMsg += `\nLive Location: ${mapsLink(rider.lat, rider.lng)}`;
+    if (["record", "mera record", "meray order", "meray orders"].includes(text.toLowerCase())) {
+      const deliveredCount = await getRiderDeliveredCount(riderId);
+      const pending = await getRiderActiveOrders(riderId);
+      let msg = deliveredCount !== null ? `📦 Aapne ab tak *${deliveredCount}* orders deliver kiye hain.\n` : "";
+      msg += pending.length
+        ? `Filhal pending: ${pending.map(o => `#${o.orderNumber || "N/A"}`).join(", ")}`
+        : "Filhal koi pending order nahi hai.";
+      return msg;
+    }
+
+    const activeOrders = await getRiderActiveOrders(riderId);
+    const issueResult = await fileRiderIssue(riderId, rider, text, activeOrders);
+
+    // Automatically hand off every order this rider still has pending — the bot
+    // figures out "jo order reh gaya" itself from the order records instead of
+    // waiting for the rider to name a number, and each new rider gets full order
+    // detail plus the old rider's last known location.
+    if (issueResult.urgent) {
+      for (const activeOrder of activeOrders) {
+        const reassignedRider = await reassignOrderToNewRider(activeOrder.id, riderId);
+        if (activeOrder.customerPhone) {
+          const customerMsg = reassignedRider
+            ? `⚠️ Aapke rider ko raaste mein masla pesh aaya, humne foran doosra rider *${reassignedRider.name || "Rider"}* bhej diya hai (Order #${activeOrder.orderNumber || "N/A"}). Sabr ke liye shukriya! 🙏`
+            : `⚠️ Aapke order (#${activeOrder.orderNumber || "N/A"}) ki delivery mein thodi dair ho sakti hai — rider ko masla pesh aaya hai. Hum jald hi doosra rider bhej rahe hain. 🙏`;
+          await sendMessage(activeOrder.customerPhone, customerMsg);
         }
-        customerMsg += `\n\nJald hi aap tak pahunch jayega!`;
-        await sendMessage(order.customerPhone, customerMsg);
-        return "✅ Status update ho gaya: Out for Delivery.";
       }
-
-      // text === "2" - Delivered
-      await firestoreOperation(() =>
-        db.collection("orders").doc(orderId).update({
-          status: "delivered_pending_confirmation",
-          deliveredAt: admin.firestore.FieldValue.serverTimestamp()
-        })
-      );
-      await firestoreOperation(() =>
-        db.collection("riders").doc(riderId).update({
-          status: "available",
-          activeOrderId: admin.firestore.FieldValue.delete()
-        })
-      );
-      await sendMessage(
-        order.customerPhone,
-        `✅ Aapka order${order.orderNumber ? ` (Order #${order.orderNumber})` : ""} deliver kar diya gaya hai.\n\n` +
-          `Agar order sahi salamat mil gaya hai to reply karein: *yes*\n` +
-          `Agar order nahi mila ya koi masla hai to reply karein: *no*`
-      );
-      return "✅ Delivery mark ho gayi — customer se confirmation ka intezar hai (yes/no).";
+    } else {
+      for (const activeOrder of activeOrders) {
+        if (activeOrder.customerPhone) {
+          await sendMessage(
+            activeOrder.customerPhone,
+            `⚠️ Aapke order (#${activeOrder.orderNumber || "N/A"}) ki delivery mein thodi dair ho sakti hai. Hum masla theek kar rahe hain. Shukriya! 🙏`
+          );
+        }
+      }
     }
 
-    const issueResult = await fileRiderIssue(riderId, rider, text, orderId || null);
-    let reassignedRider = null;
-    if (issueResult.urgent && orderId) {
-      reassignedRider = await reassignOrderToNewRider(orderId, riderId);
-    }
-    if (issueResult.customerPhone) {
-      let customerMsg = reassignedRider
-        ? `⚠️ Aapke rider ko raaste mein masla pesh aaya, humne foran doosra rider *${reassignedRider.name || "Rider"}* bhej diya hai. Sabr ke liye shukriya! 🙏`
-        : issueResult.urgent
-          ? `⚠️ Aapke order ki delivery mein thodi dair ho sakti hai — rider ko masla pesh aaya hai. Hum jald hi doosra rider bhej rahe hain. 🙏`
-          : `⚠️ Aapke order ki delivery mein thodi dair ho sakti hai. Hum masla theek kar rahe hain. Shukriya! 🙏`;
-      await sendMessage(issueResult.customerPhone, customerMsg);
-    }
     return issueResult.urgent
-      ? "🚨 Aapki emergency report mil gayi hai, staff ko foran alert kar diya gaya hai. Madad jald pahunchegi."
+      ? `🚨 Aapki emergency report mil gayi hai${activeOrders.length ? ` (${activeOrders.length} pending order${activeOrders.length === 1 ? "" : "s"} ke sath)` : ""}, staff ko foran alert kar diya gaya hai aur pending orders doosre riders ko bhej diye gaye hain. Madad jald pahunchegi.`
       : "⚠️ Aapki report dashboard par bhej di gayi hai. Shukriya batane ke liye.";
   } catch {
     return "Kuch technical masla ho gaya. Thodi dair baad try karein.";
@@ -581,6 +740,7 @@ async function handleRiderReply(riderId, text) {
 const COMPLAINT_KEYWORDS = ["complaint", "complain", "shikayat", "shikayet", "masla", "problem", "kharab", "ghalat", "late", "dair", "mushkil", "issue", "bura"];
 const URGENT_RIDER_ISSUE_KEYWORDS = ["accident", "hadsa", "hadsha", "chot", "zakhmi", "girne", "gir gaya", "takra"];
 const RIDER_ISSUE_KEYWORDS = ["petrol", "tyre", "tire", "puncher", "puncture", "panchar", "kharab", "breakdown", "band ho gayi", "phas gaya", "phas gayi", ...URGENT_RIDER_ISSUE_KEYWORDS];
+const COMPLAINT_STATUS_KEYWORDS = ["status", "meri complaint", "meri shikayat", "shikayat ka status", "complaint status"];
 
 function isComplaintMessage(lowerText) {
   return COMPLAINT_KEYWORDS.some((k) => lowerText.includes(k));
@@ -592,6 +752,10 @@ function isRiderIssueMessage(lowerText) {
 
 function isUrgentRiderIssue(lowerText) {
   return URGENT_RIDER_ISSUE_KEYWORDS.some((k) => lowerText.includes(k));
+}
+
+function isComplaintStatusQuery(lowerText) {
+  return COMPLAINT_STATUS_KEYWORDS.some((k) => lowerText.includes(k));
 }
 
 async function getMostRecentOrderForCustomer(customerPhone) {
@@ -607,6 +771,29 @@ async function getMostRecentOrderForCustomer(customerPhone) {
   } catch {
     return null;
   }
+}
+
+async function getMostRecentComplaint(customerPhone) {
+  try {
+    const snap = await firestoreOperation(() =>
+      db.collection("complaints")
+        .where("customerPhone", "==", customerPhone)
+        .orderBy("createdAt", "desc")
+        .limit(1)
+        .get()
+    );
+    return snap.empty ? null : { id: snap.docs[0].id, ...snap.docs[0].data() };
+  } catch {
+    return null;
+  }
+}
+
+function complaintStatusText(complaint) {
+  if (!complaint) return "Aapki koi complaint record mein nahi hai.";
+  if (complaint.status === "resolved") {
+    return `✅ Aapki complaint (${complaint.createdAtReadable || ""}) *hal ho chuki hai*.${complaint.resolutionNote ? `\nTafseel: ${complaint.resolutionNote}` : ""}`;
+  }
+  return `⏳ Aapki complaint (${complaint.createdAtReadable || ""}) abhi *zair-e-ghor* hai. Hamari team jald rabta karegi.`;
 }
 
 async function fileComplaint(customerPhone, complaintText) {
@@ -635,7 +822,7 @@ async function fileComplaint(customerPhone, complaintText) {
         STAFF_NUMBER,
         `📝 *Nayi Customer Complaint*\n\nCustomer: ${formatPhoneForMsg(customerPhone)}\nMessage: "${complaintText}"\n` +
           orderInfoLines +
-          `\n⚠️ Customer se rabta karein.`
+          `\n⚠️ Customer se rabta karein.\n(Hal hone par reply karein: *resolved ${formatPhoneForMsg(customerPhone)} <optional note>*)`
       );
     }
     return recentOrder;
@@ -644,26 +831,51 @@ async function fileComplaint(customerPhone, complaintText) {
   }
 }
 
-async function fileRiderIssue(riderId, riderData, issueText, orderId) {
+// Staff marks a customer's most recent open complaint resolved, and the customer is
+// automatically informed — closing the loop instead of leaving them wondering.
+async function resolveComplaintForCustomer(rawPhone, note) {
+  const customerPhone = normalizePhoneForLookup(rawPhone);
+  try {
+    const snap = await firestoreOperation(() =>
+      db.collection("complaints")
+        .where("customerPhone", "==", customerPhone)
+        .where("status", "==", "open")
+        .orderBy("createdAt", "desc")
+        .limit(1)
+        .get()
+    );
+    if (snap.empty) {
+      return { staffMsg: `Is number (${formatPhoneForMsg(customerPhone)}) ki koi open complaint nahi mili.` };
+    }
+    const doc = snap.docs[0];
+    await firestoreOperation(() =>
+      doc.ref.update({
+        status: "resolved",
+        resolutionNote: note || null,
+        resolvedAt: admin.firestore.FieldValue.serverTimestamp()
+      })
+    );
+    await sendMessage(
+      customerPhone,
+      `✅ Aapki complaint ka masla *hal ho gaya hai*.${note ? `\nTafseel: ${note}` : ""}\nShukriya sabr karne ke liye! 🙏`
+    );
+    return { staffMsg: `✅ Complaint resolved aur customer ko inform kar diya gaya hai.` };
+  } catch {
+    return { staffMsg: "Resolve karte waqt masla aaya, dobara try karein." };
+  }
+}
+
+async function fileRiderIssue(riderId, riderData, issueText, activeOrders) {
   try {
     const now = new Date();
     const urgent = isUrgentRiderIssue(issueText.toLowerCase());
-    let orderNumber = null, customerPhone = null, customerName = null, customerAddress = null;
-
-    if (orderId) {
-      try {
-        const orderSnap = await firestoreOperation(() =>
-          db.collection("orders").doc(orderId).get()
-        );
-        if (orderSnap.exists) {
-          const orderData = orderSnap.data();
-          orderNumber = orderData.orderNumber || null;
-          customerPhone = orderData.customerPhone || null;
-          customerName = orderData.customerName || null;
-          customerAddress = orderData.address || null;
-        }
-      } catch {}
-    }
+    const relatedOrders = (activeOrders || []).map(o => ({
+      orderId: o.id,
+      orderNumber: o.orderNumber || null,
+      customerPhone: o.customerPhone || null,
+      customerName: o.customerName || null,
+      address: o.address || null,
+    }));
 
     const issueData = {
       riderPhone: riderId,
@@ -671,11 +883,7 @@ async function fileRiderIssue(riderId, riderData, issueText, orderId) {
       issueText,
       urgent,
       status: "open",
-      relatedOrderId: orderId || null,
-      relatedOrderNumber: orderNumber,
-      customerPhone,
-      customerName,
-      customerAddress,
+      relatedOrders,
       lat: typeof riderData.lat === "number" ? riderData.lat : null,
       lng: typeof riderData.lng === "number" ? riderData.lng : null,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -683,9 +891,11 @@ async function fileRiderIssue(riderId, riderData, issueText, orderId) {
     };
     await firestoreOperation(() => db.collection("riderIssues").add(issueData));
 
-    const orderInfoLines = orderNumber || customerPhone || customerAddress
-      ? `\n${orderNumber ? `Order #${orderNumber}\n` : ""}${customerName ? `Customer: ${customerName}\n` : ""}${customerPhone ? `Customer Number: ${formatPhoneForMsg(customerPhone)}\n` : ""}${customerAddress ? `Address: ${customerAddress}\n` : ""}`
-      : "";
+    const orderInfoLines = relatedOrders.length
+      ? "\n" + relatedOrders.map(o =>
+          `Order #${o.orderNumber || "N/A"}${o.customerName ? ` — ${o.customerName}` : ""}${o.customerPhone ? ` (${formatPhoneForMsg(o.customerPhone)})` : ""}${o.address ? `\n  Address: ${o.address}` : ""}`
+        ).join("\n") + "\n"
+      : "\n(Is rider ke pass koi pending order darj nahi tha.)\n";
 
     if (urgent && STAFF_NUMBER) {
       const riderPhoneDisplay = formatPhoneForMsg(riderId);
@@ -694,8 +904,8 @@ async function fileRiderIssue(riderId, riderData, issueText, orderId) {
         `Rider: *${riderData.name || "N/A"}*\n` +
         `Number: ${riderPhoneDisplay}\n` +
         `Message: "${issueText}"\n` +
-        orderInfoLines;
-      if (typeof riderData.lat === "number" && typeof riderData.lng === "number") {
+        `Pending Orders:${orderInfoLines}`;
+      if (isRiderLocationFresh(riderData)) {
         alertMsg += `\nLast Known Location: ${mapsLink(riderData.lat, riderData.lng)}`;
       }
       alertMsg += `\n\n⚠️ Foran contact karein!`;
@@ -704,13 +914,12 @@ async function fileRiderIssue(riderId, riderData, issueText, orderId) {
       const riderPhoneDisplay = formatPhoneForMsg(riderId);
       await sendMessage(
         STAFF_NUMBER,
-        `⚠️ *Rider Issue Report*\n\nRider: *${riderData.name || "N/A"}*\nNumber: ${riderPhoneDisplay}\nMessage: "${issueText}"\n` +
-          orderInfoLines
+        `⚠️ *Rider Issue Report*\n\nRider: *${riderData.name || "N/A"}*\nNumber: ${riderPhoneDisplay}\nMessage: "${issueText}"\nPending Orders:${orderInfoLines}`
       );
     }
-    return { urgent, customerPhone };
+    return { urgent };
   } catch {
-    return { urgent: false, customerPhone: null };
+    return { urgent: false };
   }
 }
 
@@ -818,6 +1027,17 @@ app.post("/webhook", async (req, res) => {
     const text = (message.text?.body || "").trim();
     const lower = text.toLowerCase();
 
+    // Staff commands (e.g. resolving a complaint) — handled before anything else so
+    // staff messages never accidentally fall into the customer ordering flow.
+    if (STAFF_NUMBER && from === STAFF_NUMBER && message.type === "text") {
+      const resolveMatch = text.match(/^resolved\s+(\S+)(?:\s+([\s\S]*))?$/i);
+      if (resolveMatch) {
+        const result = await resolveComplaintForCustomer(resolveMatch[1], resolveMatch[2]);
+        await sendMessage(STAFF_NUMBER, result.staffMsg);
+        return res.sendStatus(200);
+      }
+    }
+
     // Check if Rider
     let riderDoc;
     try {
@@ -845,6 +1065,21 @@ app.post("/webhook", async (req, res) => {
         await sendMessage(from, "📍 Aapki location update ho gayi hai. Shukriya!");
         return res.sendStatus(200);
       }
+
+      // Rider sending a photo (e.g. delivery proof) — identify the customer from the
+      // rider's active order and ask THEM to confirm, rather than trusting the rider alone.
+      if (message.type === "image") {
+        const riderData = riderDoc.data();
+        const orderId = riderData.activeOrderId;
+        if (!orderId) {
+          await sendMessage(from, "Filhal aapke pass koi active order nahi hai.");
+          return res.sendStatus(200);
+        }
+        const reply = await markOrderDeliveredPendingConfirmation(from, orderId);
+        await sendMessage(from, reply);
+        return res.sendStatus(200);
+      }
+
       const reply = await handleRiderReply(from, text.trim());
       if (reply) await sendMessage(from, reply);
       return res.sendStatus(200);
@@ -911,17 +1146,13 @@ app.post("/webhook", async (req, res) => {
     // Main customer flow
     const session = await getSession(from);
 
-    // Track order
-    if (["track", "kahan", "kaha", "kidhar", "location"].some(k => lower.includes(k))) {
-      const reply = await getRiderLocationReply(from);
-      await sendMessage(from, reply);
-      return res.sendStatus(200);
-    }
-
-    // Complaint
-    const STAGES_TO_SKIP_COMPLAINT = ["address", "dinein_name", "waiting_payment", "dinein_payment"];
-    if (message.type === "text" && isComplaintMessage(lower) && !STAGES_TO_SKIP_COMPLAINT.includes(session.stage)) {
+    // If we're in the middle of collecting complaint details, that takes priority
+    // over every other keyword — this is what makes the two-step complaint flow work.
+    if (session.stage === "awaiting_complaint" && message.type === "text") {
       const recentOrder = await fileComplaint(from, text);
+      session.stage = session.resumeStage || "menu";
+      delete session.resumeStage;
+      await saveSession(from, session);
       await sendMessage(from, recentOrder
         ? `📝 Aapki shikayat darj ho gayi hai (Order #${recentOrder.orderNumber || "N/A"}). Hamari team jald rabta karegi. Shukriya!`
         : `📝 Aapki shikayat darj ho gayi hai. Hamari team jald rabta karegi. Shukriya!`
@@ -929,11 +1160,61 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // Complaint status check — lets a returning customer ask "status" and get remembered.
+    if (message.type === "text" && isComplaintStatusQuery(lower)) {
+      const complaint = await getMostRecentComplaint(from);
+      await sendMessage(from, complaintStatusText(complaint));
+      return res.sendStatus(200);
+    }
+
+    // Track order
+    if (["track", "kahan", "kaha", "kidhar", "location"].some(k => lower.includes(k))) {
+      const reply = await getRiderLocationReply(from);
+      await sendMessage(from, reply);
+      return res.sendStatus(200);
+    }
+
+    // Complaint — first ask the customer to actually describe the problem, THEN file it.
+    // (Previously: any message containing a complaint keyword was filed verbatim, so
+    // just typing "complaint" created a report with no useful detail.)
+    // A customer with an order already awaiting address/payment/confirmation must
+    // finish or cancel it before a second one can start — keeps one clear record
+    // per customer instead of two orders getting tangled in the same session.
+    const PENDING_ORDER_STAGES = ["address", "payment", "waiting_payment", "dinein_name", "dinein_payment"];
+
+    if (message.type === "text" && lower === "cancel" && PENDING_ORDER_STAGES.includes(session.stage)) {
+      session.cart = [];
+      session.address = "";
+      session.customerName = "";
+      session.isDineIn = false;
+      session.tableNumber = null;
+      session.stage = "menu";
+      await saveSession(from, session);
+      await sendMessage(from, "❌ Aapka pending order cancel kar diya gaya hai. Naya order shuru karne ke liye *menu* likhein.");
+      return res.sendStatus(200);
+    }
+
+    const STAGES_TO_SKIP_COMPLAINT = ["address", "dinein_name", "waiting_payment", "dinein_payment"];
+    if (message.type === "text" && isComplaintMessage(lower) && !STAGES_TO_SKIP_COMPLAINT.includes(session.stage)) {
+      session.resumeStage = session.stage;
+      session.stage = "awaiting_complaint";
+      await saveSession(from, session);
+      await sendMessage(from, "😟 Maazrat! Please apni complaint ki tafseel likh kar bhejein taake hum sahi tarah madad kar sakein.");
+      return res.sendStatus(200);
+    }
+
     // Menu/Order flow
     let reply = "";
     const tableMatch = text.match(/^order\s*-\s*table\s*(\d+)/i);
 
-    if (tableMatch && session.stage === "menu") {
+    if (
+      PENDING_ORDER_STAGES.includes(session.stage) &&
+      (["menu", "hi", "hello", "salam"].includes(lower) ||
+        /\b(rate|rates|price|prices|qeemat|qeematen|rate list|price list)\b/.test(lower) ||
+        /^order\s*-\s*table\s*\d+/i.test(text))
+    ) {
+      reply = `⏳ Aapka pehle se ek order pending hai (payment/confirmation ka intezar). Pehle wo mukammal karein, ya *cancel* likh kar cancel karein aur naya order shuru karein.`;
+    } else if (tableMatch && session.stage === "menu") {
       session.isDineIn = true;
       session.tableNumber = tableMatch[1];
       session.stage = "ordering";
@@ -945,7 +1226,17 @@ app.post("/webhook", async (req, res) => {
     ) {
       // NAYA: "rate list", "price", "qeemat" jaisi queries ab hamesha seedha real
       // menu dikhati hain — AI ke paas nahi jatin, taake rates kabhi galat na hon.
-      reply = menuText();
+      const isFirstGreeting = session.stage === "menu" && session.cart.length === 0 && !session.customerName;
+      if (isFirstGreeting) {
+        const profile = await getCustomerProfile(from);
+        if (profile && profile.name) {
+          reply = `Wapis khush aamdeed, ${profile.name}! 🙏\n\n${menuText()}`;
+        } else {
+          reply = menuText();
+        }
+      } else {
+        reply = menuText();
+      }
       session.stage = "ordering";
     } else if (session.stage === "ordering" && /^\d+x\d+$/.test(lower)) {
       const [itemId, qty] = lower.split("x").map(Number);
@@ -986,7 +1277,11 @@ app.post("/webhook", async (req, res) => {
         reply = `${cartText(session.cart)}\n\nOrder confirm karne ke liye apna *naam* likh dein.`;
       } else {
         session.stage = "address";
+        const profile = await getCustomerProfile(from);
         reply = `${cartText(session.cart)}\n\nAb apna delivery address likh dein.`;
+        if (profile && profile.lastAddress) {
+          reply += `\n\n(Pichli dafa aapne yeh address diya tha: "${profile.lastAddress}" — agar wahi hai to ye dobara likh dein, ya naya address bhej dein.)`;
+        }
       }
     } else if (session.stage === "dinein_name") {
       session.customerName = text;
@@ -1001,6 +1296,7 @@ app.post("/webhook", async (req, res) => {
       if (message.type === "image") {
         await notifyStaffDineIn(session.tableNumber, session.customerName, session.cart);
         reply = `✅ *Payment Accepted!* ${session.customerName}, aapka order kitchen ko bhej diya gaya hai — *Table ${session.tableNumber}*. Shukriya! 🍛`;
+        await saveCustomerProfile(from, { name: session.customerName || null });
         await clearSession(from);
       } else {
         reply = "Hum aapki payment screenshot ka intezaar kar rahe hain. Bhej dein.";
