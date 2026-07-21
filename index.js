@@ -1212,37 +1212,46 @@ app.post("/webhook", async (req, res) => {
 
       if (isYes || isNo) {
         try {
+          // NOTE: no .limit(1) here on purpose — a customer can have more
+          // than one order awaiting confirmation at once (e.g. rider used
+          // 3/20_21 to mark two orders delivered together). One "yes"/"no"
+          // from the customer applies to ALL of their pending confirmations.
           const pendingSnap = await firestoreOperation(() =>
             db.collection("orders")
               .where("customerPhone", "==", from)
               .where("status", "==", "delivered_pending_confirmation")
-              .limit(1)
               .get()
           );
           if (!pendingSnap.empty) {
-            const pendingDoc = pendingSnap.docs[0];
-            const order = pendingDoc.data();
+            const orders = pendingSnap.docs.map(d => ({ ref: d.ref, ...d.data() }));
             if (isYes) {
-              await firestoreOperation(() =>
-                pendingDoc.ref.update({
-                  status: "delivered",
-                  confirmedAt: admin.firestore.FieldValue.serverTimestamp()
-                })
-              );
+              await Promise.all(orders.map(o =>
+                firestoreOperation(() =>
+                  o.ref.update({
+                    status: "delivered",
+                    confirmedAt: admin.firestore.FieldValue.serverTimestamp()
+                  })
+                )
+              ));
               await sendMessage(from, "🙏 Shukriya! Khaane ka mazaa lein. Karachi Noor Biryani & Murgh Pulao choose karne ke liye shukriya!");
               updateAnalytics();
             } else {
-              await firestoreOperation(() =>
-                pendingDoc.ref.update({
-                  status: "delivery_issue_reported",
-                  issueReportedAt: admin.firestore.FieldValue.serverTimestamp()
-                })
-              );
+              await Promise.all(orders.map(o =>
+                firestoreOperation(() =>
+                  o.ref.update({
+                    status: "delivery_issue_reported",
+                    issueReportedAt: admin.firestore.FieldValue.serverTimestamp()
+                  })
+                )
+              ));
               await sendMessage(from, "😟 Maazrat chahenge! Hum foran is masle ko dekh rahe hain, hamari team jald aap se rabta karegi.");
               if (STAFF_NUMBER) {
+                const orderLines = orders.map(o =>
+                  `Order #${o.orderNumber || "N/A"}\nAddress: ${o.address || "N/A"}\nRider: ${o.riderName || "N/A"}`
+                ).join("\n\n");
                 await sendMessage(
                   STAFF_NUMBER,
-                  `🚨 *Delivery Issue Reported*\n\nOrder #${order.orderNumber || "N/A"}\nCustomer: ${formatPhoneForMsg(from)}\nAddress: ${order.address || "N/A"}\nRider: ${order.riderName || "N/A"}\n\n⚠️ Foran check karein!`
+                  `🚨 *Delivery Issue Reported*\n\nCustomer: ${formatPhoneForMsg(from)}\n\n${orderLines}\n\n⚠️ Foran check karein!`
                 );
               }
             }
