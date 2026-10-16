@@ -1184,6 +1184,226 @@ async function notifyStaffDineIn(tableNumber, customerName, cart) {
 }
 
 // ============================================
+// INBOX: NEW COEXISTENCE NUMBER (SAVE ONLY - BOT NEVER REPLIES)
+// Customer messages + staff phone replies (echoes) are saved in Firestore:
+//   restaurants/karachi-noor/inbox_chats/{customerPhone}                -> chat summary
+//   restaurants/karachi-noor/inbox_chats/{customerPhone}/messages/{id}  -> each message
+// ============================================
+const INBOX_PHONE_NUMBER_ID = process.env.INBOX_PHONE_NUMBER_ID || "297056673500565";
+
+function inboxMessageText(m) {
+  if (!m) return "";
+  switch (m.type) {
+    case "text": return m.text?.body || "";
+    case "image": return m.image?.caption ? `[Image] ${m.image.caption}` : "[Image]";
+    case "video": return m.video?.caption ? `[Video] ${m.video.caption}` : "[Video]";
+    case "document": return `[Document] ${m.document?.filename || m.document?.caption || ""}`.trim();
+    case "audio": return "[Voice/Audio]";
+    case "sticker": return "[Sticker]";
+    case "location": return `[Location] ${m.location?.latitude},${m.location?.longitude}`;
+    case "button": return m.button?.text || "[Button]";
+    case "reaction": return `[Reaction] ${m.reaction?.emoji || ""}`.trim();
+    case "interactive":
+      return m.interactive?.button_reply?.title || m.interactive?.list_reply?.title || "[Interactive]";
+    default: return `[${m.type || "message"}]`;
+  }
+}
+
+async function saveInboxMessage({ customerPhone, name, id, direction, text, type, tsMs, source }) {
+  if (!customerPhone || !id) return;
+  const chatRef = db.collection("restaurants").doc("karachi-noor").collection("inbox_chats").doc(String(customerPhone));
+  const msgRef = chatRef.collection("messages").doc(String(id));
+  const ts = admin.firestore.Timestamp.fromMillis(tsMs || Date.now());
+
+  await firestoreOperation(async () => {
+    const existing = await msgRef.get();
+    if (existing.exists) return; // duplicate webhook delivery
+    const batch = db.batch();
+    batch.set(msgRef, {
+      id: String(id),
+      direction, // "in" = customer, "out" = business
+      source,    // "customer" | "staff_phone" | "dashboard"
+      type: type || "text",
+      text: text || "",
+      timestamp: ts,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    const chatUpdate = {
+      phone: String(customerPhone),
+      lastMessage: (text || "").slice(0, 200),
+      lastMessageAt: ts,
+      lastDirection: direction,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (name) chatUpdate.name = name;
+    if (direction === "in") {
+      chatUpdate.lastInboundAt = ts; // used for the 24-hour window
+      chatUpdate.unreadCount = admin.firestore.FieldValue.increment(1);
+    }
+    batch.set(chatRef, chatUpdate, { merge: true });
+    await batch.commit();
+  });
+}
+
+// Returns true if this webhook call belonged to the new inbox number
+// (so the bot flow must NOT run). Never sends any reply.
+async function handleInboxWebhook(body) {
+  let handled = false;
+  for (const entry of body?.entry || []) {
+    for (const change of entry?.changes || []) {
+      const value = change?.value;
+      const phoneId = value?.metadata?.phone_number_id;
+      const isEcho = change?.field === "smb_message_echoes" || Array.isArray(value?.message_echoes);
+      const isInboxNumber = phoneId === INBOX_PHONE_NUMBER_ID;
+      if (!isEcho && !isInboxNumber) continue; // old bot number: normal flow
+      if (phoneId && !isInboxNumber) continue;  // echo of some other number
+      handled = true;
+
+      try {
+        // Customer -> restaurant
+        for (const m of value?.messages || []) {
+          const name = value?.contacts?.find(c => c.wa_id === m.from)?.profile?.name || null;
+          await saveInboxMessage({
+            customerPhone: m.from,
+            name,
+            id: m.id,
+            direction: "in",
+            text: inboxMessageText(m),
+            type: m.type,
+            tsMs: m.timestamp ? Number(m.timestamp) * 1000 : Date.now(),
+            source: "customer",
+          });
+        }
+        // Staff replied from the phone's Business app (echo)
+        for (const m of value?.message_echoes || []) {
+          await saveInboxMessage({
+            customerPhone: m.to,
+            name: null,
+            id: m.id,
+            direction: "out",
+            text: inboxMessageText(m),
+            type: m.type,
+            tsMs: m.timestamp ? Number(m.timestamp) * 1000 : Date.now(),
+            source: "staff_phone",
+          });
+        }
+        if (isEcho && !(value?.message_echoes || []).length) {
+          console.log("INBOX echo event with unexpected shape:", JSON.stringify(change).slice(0, 800));
+        }
+      } catch (err) {
+        console.error("Inbox save failed:", err.message);
+      }
+    }
+  }
+  return handled;
+}
+
+// ============================================
+// INBOX: REPLY FROM POS (token stays on this server)
+// POST /inbox/send  { to, text }   header: x-inbox-key: <INBOX_SEND_KEY>
+// Only works for chats that already exist in the inbox AND where the
+// customer wrote within the last 24 hours. Disabled unless INBOX_SEND_KEY is set.
+// ============================================
+const crypto = require("crypto");
+const INBOX_SEND_KEY = process.env.INBOX_SEND_KEY || null;
+const inboxAuthFails = new Map(); // ip -> { n, first }
+let inboxSendTimes = [];
+
+function inboxCors(req, res, next) {
+  const allowed = (process.env.INBOX_ALLOWED_ORIGINS || "").split(",").map(x => x.trim()).filter(Boolean);
+  const origin = req.headers.origin;
+  if (!allowed.length) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (origin && allowed.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-inbox-key");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+}
+
+async function inboxSendHandler(req, res) {
+  if (!INBOX_SEND_KEY) {
+    return res.status(503).json({ error: "not_configured", message: "Server par INBOX_SEND_KEY set nahi hai." });
+  }
+  const now = Date.now();
+  const ip = String(req.headers["x-forwarded-for"] || (req.socket && req.socket.remoteAddress) || "").split(",")[0].trim();
+  if (inboxAuthFails.size > 1000) inboxAuthFails.clear();
+  const f = inboxAuthFails.get(ip);
+  if (f && now - f.first < 15 * 60 * 1000 && f.n >= 10) {
+    return res.status(429).json({ error: "locked", message: "Bohat ghalat koshishen. 15 minute baad dobara try karein." });
+  }
+  const given = Buffer.from(String(req.headers["x-inbox-key"] || ""));
+  const real = Buffer.from(INBOX_SEND_KEY);
+  const ok = given.length === real.length && crypto.timingSafeEqual(given, real);
+  if (!ok) {
+    const cur = f && now - f.first < 15 * 60 * 1000 ? f : { n: 0, first: now };
+    cur.n += 1;
+    inboxAuthFails.set(ip, cur);
+    return res.status(401).json({ error: "bad_key", message: "Password ghalat hai." });
+  }
+  inboxAuthFails.delete(ip);
+
+  const to = String((req.body && req.body.to) || "").replace(/\D/g, "");
+  const text = String((req.body && req.body.text) || "").trim();
+  if (to.length < 8 || to.length > 15 || !text || text.length > 4096) {
+    return res.status(400).json({ error: "bad_request", message: "Number ya message theek nahi." });
+  }
+  inboxSendTimes = inboxSendTimes.filter(t => now - t < 60 * 1000);
+  if (inboxSendTimes.length >= 30) {
+    return res.status(429).json({ error: "slow_down", message: "Ek minute mein bohat messages. Zara ruk kar bhejein." });
+  }
+
+  try {
+    const chatRef = db.collection("restaurants").doc("karachi-noor").collection("inbox_chats").doc(to);
+    const snap = await firestoreOperation(() => chatRef.get());
+    if (!snap.exists) {
+      return res.status(404).json({ error: "no_chat", message: "Is number ki chat inbox mein nahi hai." });
+    }
+    const last = snap.data().lastInboundAt;
+    const lastMs = last && typeof last.toMillis === "function" ? last.toMillis() : 0;
+    if (!lastMs || now - lastMs > 24 * 60 * 60 * 1000) {
+      return res.status(409).json({ error: "window_closed", message: "24 ghante guzar gaye. Ab sirf template message ja sakta hai." });
+    }
+
+    let wamid = null;
+    try {
+      const r = await axios.post(
+        `https://graph.facebook.com/v20.0/${INBOX_PHONE_NUMBER_ID}/messages`,
+        { messaging_product: "whatsapp", recipient_type: "individual", to, type: "text", text: { body: text } },
+        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" }, timeout: 10000 }
+      );
+      wamid = r.data && r.data.messages && r.data.messages[0] && r.data.messages[0].id;
+    } catch (err) {
+      const meta = err.response && err.response.data && err.response.data.error;
+      console.error("Inbox send failed:", meta || err.message);
+      return res.status(502).json({
+        error: "send_failed",
+        message: meta && meta.message ? `WhatsApp ne rok diya: ${meta.message}` : "Message nahi ja saka.",
+      });
+    }
+    inboxSendTimes.push(now);
+
+    try {
+      await saveInboxMessage({
+        customerPhone: to, name: null, id: wamid || ("dash_" + now),
+        direction: "out", text, type: "text", tsMs: now, source: "dashboard",
+      });
+    } catch (err) {
+      console.error("Inbox save after send failed:", err.message);
+    }
+    return res.json({ ok: true, id: wamid });
+  } catch (err) {
+    console.error("Inbox send error:", err.message);
+    return res.status(500).json({ error: "server_error", message: "Server mein masla aaya." });
+  }
+}
+app.options("/inbox/send", inboxCors);
+app.post("/inbox/send", inboxCors, inboxSendHandler);
+
+// ============================================
 // WEBHOOK
 // ============================================
 app.get("/webhook", (req, res) => {
@@ -1199,6 +1419,10 @@ app.get("/webhook", (req, res) => {
 
 app.post("/webhook", async (req, res) => {
   try {
+    // NEW: messages for the new coexistence number are only saved to
+    // Firestore. The bot never replies to them.
+    if (await handleInboxWebhook(req.body)) return res.sendStatus(200);
+
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
