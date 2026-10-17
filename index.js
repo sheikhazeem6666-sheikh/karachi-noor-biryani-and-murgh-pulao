@@ -1306,6 +1306,7 @@ async function handleInboxWebhook(body) {
 // ============================================
 const crypto = require("crypto");
 const INBOX_SEND_KEY = process.env.INBOX_SEND_KEY || null;
+const INBOX_WA_TOKEN = process.env.INBOX_WHATSAPP_TOKEN || WHATSAPP_TOKEN;
 const inboxAuthFails = new Map(); // ip -> { n, first }
 let inboxSendTimes = [];
 
