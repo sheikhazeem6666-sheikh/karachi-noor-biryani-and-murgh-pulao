@@ -1209,7 +1209,7 @@ function inboxMessageText(m) {
   }
 }
 
-async function saveInboxMessage({ customerPhone, name, id, direction, text, type, tsMs, source }) {
+async function saveInboxMessage({ customerPhone, name, id, direction, text, type, tsMs, source, mediaId, mime }) {                                                         
   if (!customerPhone || !id) return;
   const chatRef = db.collection("restaurants").doc("karachi-noor").collection("inbox_chats").doc(String(customerPhone));
   const msgRef = chatRef.collection("messages").doc(String(id));
@@ -1224,8 +1224,9 @@ async function saveInboxMessage({ customerPhone, name, id, direction, text, type
       direction, // "in" = customer, "out" = business
       source,    // "customer" | "staff_phone" | "dashboard"
       type: type || "text",
-      text: text || "",
+text: text || "",
       timestamp: ts,
+  ...(mediaId ? { mediaId: String(mediaId), mime: String(mime || "") } : {}),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     const chatUpdate = {
@@ -1272,6 +1273,9 @@ async function handleInboxWebhook(body) {
             type: m.type,
             tsMs: m.timestamp ? Number(m.timestamp) * 1000 : Date.now(),
             source: "customer",
+            mediaId: m.type === "audio" ? m.audio?.id : null,
+mime: m.type === "audio" ? m.audio?.mime_type : null,
+            
           });
         }
         // Staff replied from the phone's Business app (echo)
@@ -1285,6 +1289,8 @@ async function handleInboxWebhook(body) {
             type: m.type,
             tsMs: m.timestamp ? Number(m.timestamp) * 1000 : Date.now(),
             source: "staff_phone",
+            mediaId: m.type === "audio" ? m.audio?.id : null,
+mime: m.type === "audio" ? m.audio?.mime_type : null,
           });
         }
         if (isEcho && !(value?.message_echoes || []).length) {
