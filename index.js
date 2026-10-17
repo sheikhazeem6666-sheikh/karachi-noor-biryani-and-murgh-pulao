@@ -1374,7 +1374,7 @@ async function inboxSendHandler(req, res) {
       const r = await axios.post(
         `https://graph.facebook.com/v20.0/${INBOX_PHONE_NUMBER_ID}/messages`,
         { messaging_product: "whatsapp", recipient_type: "individual", to, type: "text", text: { body: text } },
-        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" }, timeout: 10000 }
+        { headers: { Authorization: `Bearer ${INBOX_WA_TOKEN}`, "Content-Type": "application/json" }, timeout: 10000 }
       );
       wamid = r.data && r.data.messages && r.data.messages[0] && r.data.messages[0].id;
     } catch (err) {
