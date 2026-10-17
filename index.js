@@ -1419,6 +1419,10 @@ app.get("/webhook", (req, res) => {
 
 app.post("/webhook", async (req, res) => {
   try {
+    try {
+      const _e = (req.body?.entry || []).map(en => (en.changes || []).map(c => `${c.field}:${c.value?.metadata?.phone_number_id || "-"}`).join(",")).join(" | ");
+      console.log("WEBHOOK HIT:", req.body?.object, _e);
+    } catch (_) {}
     // NEW: messages for the new coexistence number are only saved to
     // Firestore. The bot never replies to them.
     if (await handleInboxWebhook(req.body)) return res.sendStatus(200);
