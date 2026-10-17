@@ -1402,6 +1402,57 @@ async function inboxSendHandler(req, res) {
 }
 app.options("/inbox/send", inboxCors);
 app.post("/inbox/send", inboxCors, inboxSendHandler);
+// ===== INBOX MEDIA: voice/photo/video dekhne ke liye =====
+function inboxMediaInfo(m) {
+  if (!m) return null;
+  const x = m.audio || m.image || m.video || m.document || m.sticker;
+  if (!x || !x.id) return null;
+  return { mediaId: String(x.id), mime: x.mime_type || "", filename: (m.document && m.document.filename) || "" };
+}
+
+async function saveInboxMedia(customerPhone, m) {
+  try {
+    const info = inboxMediaInfo(m);
+    if (!info || !customerPhone || !m.id) return;
+    await firestoreOperation(() =>
+      db.collection("restaurants").doc("karachi-noor").collection("inbox_chats")
+        .doc(String(customerPhone)).collection("messages").doc(String(m.id))
+        .set(info, { merge: true })
+    );
+  } catch (err) {
+    console.error("Inbox media save failed:", err.message);
+  }
+}
+
+async function inboxMediaHandler(req, res) {
+  if (!INBOX_SEND_KEY) return res.status(503).json({ error: "not_configured" });
+  const given = Buffer.from(String(req.headers["x-inbox-key"] || ""));
+  const real = Buffer.from(INBOX_SEND_KEY);
+  if (!(given.length === real.length && crypto.timingSafeEqual(given, real))) {
+    return res.status(401).json({ error: "bad_key" });
+  }
+  const id = String(req.params.id || "").replace(/\D/g, "");
+  if (!id) return res.status(400).json({ error: "bad_id" });
+  try {
+    const meta = await axios.get(`https://graph.facebook.com/v20.0/${id}`, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }, timeout: 10000,
+    });
+    const url = meta.data && meta.data.url;
+    if (!url) return res.status(404).json({ error: "no_url" });
+    const file = await axios.get(url, {
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+      responseType: "arraybuffer", timeout: 30000, maxContentLength: 16 * 1024 * 1024,
+    });
+    res.setHeader("Content-Type", meta.data.mime_type || "application/octet-stream");
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    return res.send(Buffer.from(file.data));
+  } catch (err) {
+    console.error("Inbox media failed:", err.response && err.response.data ? JSON.stringify(err.response.data).slice(0, 300) : err.message);
+    return res.status(502).json({ error: "media_failed" });
+  }
+}
+app.options("/inbox/media/:id", inboxCors);
+app.get("/inbox/media/:id", inboxCors, inboxMediaHandler);
 
 // ============================================
 // WEBHOOK
