@@ -1273,8 +1273,7 @@ async function handleInboxWebhook(body) {
             type: m.type,
             tsMs: m.timestamp ? Number(m.timestamp) * 1000 : Date.now(),
             source: "customer",
-            mediaId: m.type === "audio" ? m.audio?.id : null,
-mime: m.type === "audio" ? m.audio?.mime_type : null,
+            mediaId: (inboxMediaInfo(m) || {}).mediaId || null, mime: (inboxMediaInfo(m) || {}).mime || null,
             
           });
         }
@@ -1289,8 +1288,8 @@ mime: m.type === "audio" ? m.audio?.mime_type : null,
             type: m.type,
             tsMs: m.timestamp ? Number(m.timestamp) * 1000 : Date.now(),
             source: "staff_phone",
-            mediaId: m.type === "audio" ? m.audio?.id : null,
-mime: m.type === "audio" ? m.audio?.mime_type : null,
+            mediaId: (inboxMediaInfo(m) || {}).mediaId || null,
+mime: (inboxMediaInfo(m) || {}).mime || null,
           });
         }
         if (isEcho && !(value?.message_echoes || []).length) {
