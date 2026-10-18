@@ -1292,6 +1292,27 @@ async function handleInboxWebhook(body) {
 mime: (inboxMediaInfo(m) || {}).mime || null,
           });
         }
+        // ===== v59: tick (bheja / pohancha / dekh liya) =====
+        for (const st of value?.statuses || []) {
+          try {
+            if (!st || !st.id || !st.recipient_id || !st.status) continue;
+            const mref = db.collection("restaurants").doc("karachi-noor").collection("inbox_chats")
+              .doc(String(st.recipient_id)).collection("messages").doc(String(st.id));
+            const msnap = await firestoreOperation(() => mref.get());
+            if (!msnap.exists) continue;
+            const rank = { sent: 1, delivered: 2, read: 3, failed: 4 };
+            const oldSt = msnap.data().status;
+            if ((rank[st.status] || 0) <= (rank[oldSt] || 0)) continue;
+            const upd = { status: st.status };
+            if (st.status === "failed") {
+              const e0 = st.errors && st.errors[0];
+              upd.statusError = (e0 && (e0.title || e0.message)) || "Nahi ja saka";
+            }
+            await firestoreOperation(() => mref.update(upd));
+          } catch (err) {
+            console.error("Inbox status save failed:", err.message);
+          }
+        }
         if (isEcho && !(value?.message_echoes || []).length) {
           console.log("INBOX echo event with unexpected shape:", JSON.stringify(change).slice(0, 800));
         }
