@@ -1408,6 +1408,102 @@ async function inboxSendHandler(req, res) {
 }
 app.options("/inbox/send", inboxCors);
 app.post("/inbox/send", inboxCors, inboxSendHandler);
+// ===== INBOX SEND MEDIA: photo/video/voice bhejna =====
+async function inboxSendMediaHandler(req, res) {
+  try {
+    if (!INBOX_SEND_KEY) return res.status(503).json({ error: "not_configured" });
+    const given = Buffer.from(String(req.headers["x-inbox-key"] || ""));
+    const real = Buffer.from(INBOX_SEND_KEY);
+    if (!(given.length === real.length && crypto.timingSafeEqual(given, real))) {
+      return res.status(401).json({ error: "bad_key", message: "Password ghalat hai." });
+    }
+    const to = String(req.query.to || "").replace(/\D/g, "");
+    const caption = String(req.query.caption || "").slice(0, 1000);
+    const mime = String(req.headers["content-type"] || "").split(";")[0].trim();
+    const body = req.body;
+    if (to.length < 8 || to.length > 15 || !Buffer.isBuffer(body) || !body.length) {
+      return res.status(400).json({ error: "bad_request", message: "Number ya file theek nahi." });
+    }
+    let kind = null;
+    if (mime.startsWith("image/")) kind = "image";
+    else if (mime.startsWith("video/")) kind = "video";
+    else if (mime.startsWith("audio/")) kind = "audio";
+    if (!kind) return res.status(400).json({ error: "bad_type", message: "Ye file type nahi ja sakti." });
+
+    const now = Date.now();
+    inboxSendTimes = inboxSendTimes.filter(t => now - t < 60 * 1000);
+    if (inboxSendTimes.length >= 30) {
+      return res.status(429).json({ error: "slow_down", message: "Ek minute mein bohat messages. Zara ruk kar bhejein." });
+    }
+
+    const chatRef = db.collection("restaurants").doc("karachi-noor").collection("inbox_chats").doc(to);
+    const snap = await firestoreOperation(() => chatRef.get());
+    if (!snap.exists) return res.status(404).json({ error: "no_chat", message: "Is number ki chat inbox mein nahi hai." });
+    const last = snap.data().lastInboundAt;
+    const lastMs = last && typeof last.toMillis === "function" ? last.toMillis() : 0;
+    if (!lastMs || now - lastMs > 24 * 60 * 60 * 1000) {
+      return res.status(409).json({ error: "window_closed", message: "24 ghante guzar gaye. Ab sirf template message ja sakta hai." });
+    }
+
+    // Step A: file WhatsApp par upload
+    const form = new FormData();
+    form.append("messaging_product", "whatsapp");
+    form.append("type", mime);
+    form.append("file", new Blob([body], { type: mime }), "file");
+    const up = await fetch("https://graph.facebook.com/v20.0/" + INBOX_PHONE_NUMBER_ID + "/media", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + INBOX_WA_TOKEN },
+      body: form,
+    });
+    const upj = await up.json().catch(() => ({}));
+    if (!up.ok || !upj.id) {
+      console.error("Inbox media upload failed:", upj);
+      return res.status(502).json({ error: "upload_failed", message: "File upload nahi ho saki." });
+    }
+
+    // Step B: customer ko bhejna
+    const payload = { messaging_product: "whatsapp", recipient_type: "individual", to, type: kind };
+    payload[kind] = { id: upj.id };
+    if (caption && kind !== "audio") payload[kind].caption = caption;
+    let wamid = null;
+    try {
+      const r = await axios.post(
+        `https://graph.facebook.com/v20.0/${INBOX_PHONE_NUMBER_ID}/messages`,
+        payload,
+        { headers: { Authorization: `Bearer ${INBOX_WA_TOKEN}`, "Content-Type": "application/json" }, timeout: 20000 }
+      );
+      wamid = r.data && r.data.messages && r.data.messages[0] && r.data.messages[0].id;
+    } catch (err) {
+      const meta = err.response && err.response.data && err.response.data.error;
+      console.error("Inbox media send failed:", meta || err.message);
+      return res.status(502).json({
+        error: "send_failed",
+        message: meta && meta.message ? `WhatsApp ne rok diya: ${meta.message}` : "Message nahi ja saka.",
+      });
+    }
+    inboxSendTimes.push(now);
+
+    // Step C: Firestore mein save (POS mein nazar aaye)
+    const msgId = wamid || ("dash_" + now);
+    try {
+      await saveInboxMessage({
+        customerPhone: to, name: null, id: msgId,
+        direction: "out", text: caption, type: kind, tsMs: now, source: "dashboard",
+      });
+      const m = { id: msgId };
+      m[kind] = { id: upj.id, mime_type: mime };
+      await saveInboxMedia(to, m);
+    } catch (err) {
+      console.error("Inbox media save failed:", err.message);
+    }
+    return res.json({ ok: true, id: wamid });
+  } catch (err) {
+    console.error("Inbox send-media error:", err.message);
+    return res.status(500).json({ error: "server_error", message: "Server mein masla aaya." });
+  }
+}
+app.options("/inbox/send-media", inboxCors);
+app.post("/inbox/send-media", inboxCors, express.raw({ type: "*/*", limit: "16mb" }), inboxSendMediaHandler);
 // ===== INBOX MEDIA: voice/photo/video dekhne ke liye =====
 function inboxMediaInfo(m) {
   if (!m) return null;
