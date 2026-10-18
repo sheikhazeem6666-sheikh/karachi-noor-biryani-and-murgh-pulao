@@ -1429,6 +1429,95 @@ async function inboxSendHandler(req, res) {
 }
 app.options("/inbox/send", inboxCors);
 app.post("/inbox/send", inboxCors, inboxSendHandler);
+// ===== INBOX SEND REPLY: kisi message ka jawab (naya) =====
+app.options("/inbox/send-reply", inboxCors);
+app.post("/inbox/send-reply", inboxCors, inboxSendReplyHandler);
+async function inboxSendReplyHandler(req, res) {
+  if (!INBOX_SEND_KEY) {
+    return res.status(503).json({ error: "not_configured", message: "Server par INBOX_SEND_KEY set nahi hai." });
+  }
+  const now = Date.now();
+  const ip = String(req.headers["x-forwarded-for"] || (req.socket && req.socket.remoteAddress) || "").split(",")[0].trim();
+  if (inboxAuthFails.size > 1000) inboxAuthFails.clear();
+  const f = inboxAuthFails.get(ip);
+  if (f && now - f.first < 15 * 60 * 1000 && f.n >= 10) {
+    return res.status(429).json({ error: "locked", message: "Bohat ghalat koshishen. 15 minute baad dobara try karein." });
+  }
+  const given = Buffer.from(String(req.headers["x-inbox-key"] || ""));
+  const real = Buffer.from(INBOX_SEND_KEY);
+  const ok = given.length === real.length && crypto.timingSafeEqual(given, real);
+  if (!ok) {
+    const cur = f && now - f.first < 15 * 60 * 1000 ? f : { n: 0, first: now };
+    cur.n += 1;
+    inboxAuthFails.set(ip, cur);
+    return res.status(401).json({ error: "bad_key", message: "Password ghalat hai." });
+  }
+  inboxAuthFails.delete(ip);
+
+  const to = String((req.body && req.body.to) || "").replace(/\D/g, "");
+  const text = String((req.body && req.body.text) || "").trim();
+  const replyTo = String((req.body && req.body.replyTo) || "").trim().slice(0, 200);
+  if (to.length < 8 || to.length > 15 || !text || text.length > 4096) {
+    return res.status(400).json({ error: "bad_request", message: "Number ya message theek nahi." });
+  }
+  inboxSendTimes = inboxSendTimes.filter(t => now - t < 60 * 1000);
+  if (inboxSendTimes.length >= 30) {
+    return res.status(429).json({ error: "slow_down", message: "Ek minute mein bohat messages. Zara ruk kar bhejein." });
+  }
+
+  try {
+    const chatRef = db.collection("restaurants").doc("karachi-noor").collection("inbox_chats").doc(to);
+    const snap = await firestoreOperation(() => chatRef.get());
+    if (!snap.exists) {
+      return res.status(404).json({ error: "no_chat", message: "Is number ki chat inbox mein nahi hai." });
+    }
+    const last = snap.data().lastInboundAt;
+    const lastMs = last && typeof last.toMillis === "function" ? last.toMillis() : 0;
+    if (!lastMs || now - lastMs > 24 * 60 * 60 * 1000) {
+      return res.status(409).json({ error: "window_closed", message: "24 ghante guzar gaye. Ab sirf template message ja sakta hai." });
+    }
+
+    const payload = { messaging_product: "whatsapp", recipient_type: "individual", to, type: "text", text: { body: text } };
+    if (replyTo) payload.context = { message_id: replyTo };
+
+    let wamid = null;
+    try {
+      const r = await axios.post(
+        `https://graph.facebook.com/v20.0/${INBOX_PHONE_NUMBER_ID}/messages`,
+        payload,
+        { headers: { Authorization: `Bearer ${INBOX_WA_TOKEN}`, "Content-Type": "application/json" }, timeout: 10000 }
+      );
+      wamid = r.data && r.data.messages && r.data.messages[0] && r.data.messages[0].id;
+    } catch (err) {
+      const meta = err.response && err.response.data && err.response.data.error;
+      console.error("Inbox reply send failed:", meta || err.message);
+      return res.status(502).json({
+        error: "send_failed",
+        message: meta && meta.message ? `WhatsApp ne rok diya: ${meta.message}` : "Message nahi ja saka.",
+      });
+    }
+    inboxSendTimes.push(now);
+
+    try {
+      const msgId = wamid || ("dash_" + now);
+      await saveInboxMessage({
+        customerPhone: to, name: null, id: msgId,
+        direction: "out", text, type: "text", tsMs: now, source: "dashboard",
+      });
+      if (replyTo) {
+        await firestoreOperation(() =>
+          chatRef.collection("messages").doc(String(msgId)).set({ replyTo }, { merge: true })
+        );
+      }
+    } catch (err) {
+      console.error("Inbox reply save failed:", err.message);
+    }
+    return res.json({ ok: true, id: wamid });
+  } catch (err) {
+    console.error("Inbox reply error:", err.message);
+    return res.status(500).json({ error: "server_error", message: "Server mein masla aaya." });
+  }
+}
 // ===== INBOX SEND MEDIA: photo/video/voice bhejna =====
 async function inboxSendMediaHandler(req, res) {
   try {
