@@ -1209,6 +1209,46 @@ function inboxMessageText(m) {
   }
 }
 
+async function inboxBotReply(m, name) {
+  const base = db.collection("restaurants").doc("karachi-noor");
+  const sSnap = await firestoreOperation(() => base.collection("settings").doc("inbox_bot").get());
+  if (!sSnap.exists || sSnap.data().enabled !== true) return; // switch OFF
+  let userText = inboxMessageText(m);
+  if (!userText) return;
+
+  const hSnap = await firestoreOperation(() =>
+    base.collection("inbox_chats").doc(String(m.from)).collection("messages")
+      .orderBy("timestamp", "desc").limit(8).get());
+  const history = [];
+  hSnap.docs.reverse().forEach(d => {
+    const x = d.data();
+    if (String(x.id) === String(m.id) || !x.text) return;
+    const role = x.direction === "in" ? "user" : "assistant";
+    const last = history[history.length - 1];
+    if (last && last.role === role) last.content += "\n" + x.text;
+    else history.push({ role, content: x.text });
+  });
+  while (history.length && history[0].role !== "user") history.shift();
+  if (history.length && history[history.length - 1].role === "user") {
+    userText = history.pop().content + "\n" + userText;
+  }
+
+  const reply = await getHaikuReply(userText, history);
+  if (!reply) return;
+
+  const r = await axios.post(
+    `https://graph.facebook.com/v20.0/${INBOX_PHONE_NUMBER_ID}/messages`,
+    { messaging_product: "whatsapp", recipient_type: "individual", to: m.from, type: "text", text: { body: reply } },
+    { headers: { Authorization: `Bearer ${INBOX_WA_TOKEN}`, "Content-Type": "application/json" }, timeout: 10000 }
+  );
+  const wamid = r.data && r.data.messages && r.data.messages[0] && r.data.messages[0].id;
+  if (wamid) {
+    await saveInboxMessage({
+      customerPhone: m.from, name: null, id: wamid, direction: "out",
+      text: reply, type: "text", tsMs: Date.now(), source: "ai_bot"
+    });
+  }
+}
 async function saveInboxMessage({ customerPhone, name, id, direction, text, type, tsMs, source, mediaId, mime }) {                                                         
   if (!customerPhone || !id) return;
   const chatRef = db.collection("restaurants").doc("karachi-noor").collection("inbox_chats").doc(String(customerPhone));
@@ -1276,6 +1316,11 @@ async function handleInboxWebhook(body) {
             mediaId: (inboxMediaInfo(m) || {}).mediaId || null, mime: (inboxMediaInfo(m) || {}).mime || null,
             
           });
+          try {
+            if (m.type === "text") await inboxBotReply(m, name);
+          } catch (e) {
+            console.error("Inbox bot failed:", e.message);
+          }
         }
         // Staff replied from the phone's Business app (echo)
         for (const m of value?.message_echoes || []) {
